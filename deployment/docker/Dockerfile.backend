@@ -1,0 +1,27 @@
+FROM python:3.11-slim
+
+# System deps for C-extension packages (lxml, python-Levenshtein)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libxml2-dev \
+    libxslt1-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies first (layer-cache friendly)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY main.py .
+COPY backend/ ./backend/
+
+# Create data directory
+RUN mkdir -p /app/data/raw/apr /app/data/raw/procurement
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--log-level", "info"]
