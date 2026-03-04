@@ -1,0 +1,31 @@
+# environment
+.env
+.env.*
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# logs
+*.log
+
+# docker / runtime
+data/
+neo4j_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
