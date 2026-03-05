@@ -41,6 +41,7 @@ class GraphLoader:
         self.load_opendata()
         self.load_ujn_institutions()
         self.load_ujn_procurements()
+        self.load_jnportal_data()
         self.load_parties()
         self.resolver.save(RESOLVER_STATE)
         logger.info("graph_load_complete", stats=self.resolver.stats())
@@ -78,6 +79,116 @@ class GraphLoader:
             except Exception as e:
                 logger.error("ujn_proc_load_failed", path=path, error=str(e))
         logger.info("ujn_proc_load_done", loaded=loaded)
+
+    def load_jnportal_data(self):
+        """Load contracts from JN Portal scraper (jnportal_contracts.json)."""
+        path = os.path.join(DATA_DIR, "raw", "ujn", "jnportal_contracts.json")
+        if not os.path.exists(path):
+            logger.info("jnportal_data_missing", path=path)
+            return
+        with open(path, encoding="utf-8") as f:
+            records = json.load(f)
+        inst_path = os.path.join(DATA_DIR, "raw", "institutions", "jnportal_institutions.json")
+        if os.path.exists(inst_path):
+            with open(inst_path, encoding="utf-8") as f:
+                for inst in json.load(f):
+                    self._load_jnportal_institution(inst)
+        loaded = 0
+        for rec in records:
+            self._load_jnportal_contract(rec)
+            loaded += 1
+        logger.info("jnportal_load_done", loaded=loaded)
+
+    def _load_jnportal_institution(self, record: dict):
+        """MERGE an institution from JN Portal data (PIB-keyed)."""
+        pib = record.get("pib", "")
+        name = record.get("name", "")
+        if not pib or not name:
+            return
+        iid = record.get("institution_id") or f"JNP-INST-{pib}"
+        run_query("""
+            MERGE (i:Institution {institution_id: $iid})
+            SET i.name            = $name,
+                i.name_normalized = $name_norm,
+                i.pib             = $pib,
+                i.source          = 'jnportal',
+                i.updated_at      = $now
+        """, {
+            "iid": iid,
+            "name": name,
+            "name_norm": record.get("name_normalized", ""),
+            "pib": pib,
+            "now": datetime.utcnow().isoformat(),
+        })
+
+    def _load_jnportal_contract(self, record: dict):
+        """MERGE a JN Portal contract and link to institution and supplier."""
+        cid = record.get("contract_id")
+        title = record.get("title") or record.get("subject", "")
+        if not cid or not title:
+            return
+
+        value = record.get("contract_value") or 0
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0.0
+
+        run_query("""
+            MERGE (c:Contract {contract_id: $cid})
+            SET c.title            = $title,
+                c.value_rsd        = $value,
+                c.award_date       = $date,
+                c.proc_type        = $proc_type,
+                c.has_award        = $has_award,
+                c.source           = 'jnportal',
+                c.verification_url = $vurl,
+                c.updated_at       = $now
+        """, {
+            "cid": cid,
+            "title": str(title)[:250],
+            "value": value,
+            "date": record.get("date_modified", ""),
+            "proc_type": record.get("proc_type", ""),
+            "has_award": bool(record.get("has_award_decision", False)),
+            "vurl": record.get("detail_url", ""),
+            "now": datetime.utcnow().isoformat(),
+        })
+
+        # Link to institution by PIB
+        inst_pib = (record.get("institution_pib") or "").strip()
+        if inst_pib:
+            run_query("""
+                MATCH (i:Institution {pib: $pib})
+                MATCH (c:Contract {contract_id: $cid})
+                MERGE (i)-[:AWARDED_CONTRACT]->(c)
+            """, {"pib": inst_pib, "cid": cid})
+
+        # Supplier / Company
+        supplier_name = (record.get("supplier_name") or "").strip()
+        supplier_pib = (record.get("supplier_pib") or "").strip()
+
+        if supplier_name or supplier_pib:
+            # Use PIB as primary key; fall back to hash of name
+            co_key = supplier_pib if supplier_pib else f"PIB_{abs(hash(supplier_name)) % 10**10}"
+            # Also set maticni_broj = pib so detection queries (which use maticni_broj) work
+            run_query("""
+                MERGE (co:Company {pib: $pib})
+                SET co.name          = coalesce(co.name, $name),
+                    co.maticni_broj  = coalesce(co.maticni_broj, $pib),
+                    co.source        = coalesce(co.source, 'jnportal'),
+                    co.updated_at    = $now
+            """, {
+                "pib": co_key,
+                "name": supplier_name or co_key,
+                "now": datetime.utcnow().isoformat(),
+            })
+            run_query("""
+                MATCH (co:Company {pib: $pib})
+                MATCH (c:Contract {contract_id: $cid})
+                MERGE (co)-[r:WON_CONTRACT]->(c)
+                SET r.source = 'jnportal'
+            """, {"pib": co_key, "cid": cid})
 
     def load_parties(self):
         """Load political parties from data.gov.rs scraper output."""

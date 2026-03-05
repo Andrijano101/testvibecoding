@@ -787,6 +787,14 @@ def _run_scrape(source: str, since_days: int = 7, years: str = None, force_refre
             s.close()
             logger.info("scrape_done", source="procurement")
 
+        if source in ("jnportal", "all"):
+            from backend.scrapers.jnportal_scraper import JNPortalScraper
+            s = JNPortalScraper()
+            max_rows = int(os.getenv("JNPORTAL_MAX_ROWS", "2000"))
+            s.scrape(max_rows=max_rows, force_refresh=force_refresh)
+            s.client.close()
+            logger.info("scrape_done", source="jnportal")
+
     except Exception as e:
         logger.error("scrape_failed", source=source, error=str(e))
 
@@ -812,6 +820,8 @@ def _run_load(source: str):
         elif source == "ujn":
             loader.load_ujn_institutions()
             loader.load_ujn_procurements()
+        elif source == "jnportal":
+            loader.load_jnportal_data()
         else:
             loader.load_all()
     finally:
@@ -830,7 +840,7 @@ def trigger_scrape(
     source: rik | opendata | gazette | rgz | procurement | all
     Runs in a background thread (non-blocking).
     """
-    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "all"}
+    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
     t = threading.Thread(
@@ -855,7 +865,7 @@ def load_source(source: str):
     Load scraped data for a specific source into Neo4j.
     source: apr | procurement | rik | gazette | rgz | opendata
     """
-    valid = {"apr", "procurement", "rik", "gazette", "rgz", "opendata"}
+    valid = {"apr", "procurement", "rik", "gazette", "rgz", "opendata", "ujn", "jnportal"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
     _run_load(source)
@@ -896,7 +906,7 @@ def ingest_source(
     For 'all': scrapes all sources then loads everything into Neo4j.
     This is the recommended way to populate with real data.
     """
-    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "all"}
+    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
 
