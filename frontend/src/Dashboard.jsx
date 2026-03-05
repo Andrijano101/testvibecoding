@@ -75,6 +75,8 @@ const PATTERN_LABELS = {
   shell_company_cluster: "Shell kompanije",
   budget_self_allocation: "Samododeljivanje",
   political_donor_contract: "Donator→Ugovor",
+  repeated_winner: "Stalni pobednik",
+  new_company_big_contract: "Nova firma — veliki ugovor",
 };
 
 // Real Serbian government portal URLs for verification
@@ -560,11 +562,18 @@ function ForceGraph({ nodes, edges, onNodeClick, highlightIds }) {
       )
       .on("click", (e, d) => onNodeClick?.(d));
 
+    const isSeed = d => d.props?.source === 'seed';
+
     node.append("circle")
       .attr("r", d => d.type === "Institution" ? 20 : d.type === "Company" ? 17 : d.type === "Contract" ? 14 : 16)
       .attr("fill", d => ENTITY_COLORS[d.type] || "#6b7280")
-      .attr("stroke", d => isHl(d) && highlightIds ? "#fff" : "transparent")
-      .attr("stroke-width", d => isHl(d) && highlightIds ? 3 : 0)
+      .attr("fill-opacity", d => isSeed(d) ? 0.4 : 1)
+      .attr("stroke", d => {
+        if (isSeed(d)) return "#f59e0b";
+        return isHl(d) && highlightIds ? "#fff" : "transparent";
+      })
+      .attr("stroke-width", d => isSeed(d) ? 1.5 : (isHl(d) && highlightIds ? 3 : 0))
+      .attr("stroke-dasharray", d => isSeed(d) ? "4,3" : null)
       .attr("opacity", d => isHl(d) ? 1 : 0.12)
       .attr("filter", d => isHl(d) && highlightIds ? "url(#glow)" : null);
 
@@ -576,6 +585,13 @@ function ForceGraph({ nodes, edges, onNodeClick, highlightIds }) {
       .attr("dy", 32).attr("text-anchor", "middle").attr("font-size", 10)
       .attr("fill", "#cbd5e1").attr("font-family", "'DM Sans', sans-serif")
       .attr("opacity", d => isHl(d) ? 1 : 0.12).attr("pointer-events", "none");
+
+    // TEST badge for seed nodes
+    node.filter(d => isSeed(d)).append("text")
+      .text("TEST")
+      .attr("dy", -22).attr("text-anchor", "middle")
+      .attr("font-size", 6).attr("fill", "#f59e0b").attr("font-weight", 700)
+      .attr("font-family", "'IBM Plex Mono', monospace").attr("pointer-events", "none");
 
     sim.on("tick", () => {
       link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
@@ -848,15 +864,28 @@ export default function Dashboard() {
       (PATTERN_LABELS[a.pattern_type] || "").toLowerCase().includes(searchQuery.toLowerCase())
     ), [alerts, searchQuery]);
 
+  const realNodeCount = useMemo(() => nodes.filter(n => n.props?.source !== 'seed').length, [nodes]);
+  const testNodeCount = useMemo(() => nodes.filter(n => n.props?.source === 'seed').length, [nodes]);
+
   // Honest source registry — what data is actually in the DB and where it came from
   const SOURCE_REGISTRY = [
     {
       key: "seed",
       name: "Sintetički test podaci",
-      description: "Veštački podaci generisani za demonstraciju svih 8 obrazaca korupcije. NISU pravi podaci — služe isključivo za testiranje.",
+      description: "Veštački podaci generisani za demonstraciju svih 8 obrazaca korupcije. NISU pravi podaci — služe isključivo za testiranje. Čvorovi su vizuelno označeni isprekidanim okvirom i natpisom TEST.",
       badge: "TEST",
       badgeColor: "#f59e0b",
       url: null,
+      countLabel: "čvorova",
+    },
+    {
+      key: "jnportal",
+      name: "JN Portal — Portal javnih nabavki",
+      description: "Pravi ugovori o javnim nabavkama sa jnportal.ujn.gov.rs — naziv pobednika, PIB kompanije, vrednost ugovora, datum. 1.3M+ ugovora ukupno; skupljaju se ugovori >1M RSD sortirani po vrednosti.",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
+      url: "https://jnportal.ujn.gov.rs/contracts",
+      urlLabel: "jnportal.ujn.gov.rs",
       countLabel: "čvorova",
     },
     {
@@ -1054,9 +1083,17 @@ export default function Dashboard() {
             <div style={{ marginBottom: 18 }}>
               <div style={{ fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.12em", color: "#475569", marginBottom: 4, fontFamily: "'IBM Plex Mono', monospace", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span>Pregled baze</span>
-                {!isDemo && flaggedCounts != null && (
-                  <span style={{ fontSize: 8, color: "#dc2626", background: "#dc262615", padding: "1px 5px", borderRadius: 3, fontWeight: 700 }}>⚠ SUMNJIVI</span>
-                )}
+                <div style={{ display: "flex", gap: 3 }}>
+                  {!isDemo && realNodeCount > 0 && (
+                    <span style={{ fontSize: 7, color: "#10b981", background: "#10b98115", padding: "1px 4px", borderRadius: 3, fontWeight: 700, border: "1px solid #10b98133" }}>◉ REAL</span>
+                  )}
+                  {!isDemo && testNodeCount > 0 && (
+                    <span style={{ fontSize: 7, color: "#f59e0b", background: "#f59e0b15", padding: "1px 4px", borderRadius: 3, fontWeight: 700, border: "1px solid #f59e0b33" }}>◌ TEST</span>
+                  )}
+                  {!isDemo && flaggedCounts != null && (
+                    <span style={{ fontSize: 7, color: "#dc2626", background: "#dc262615", padding: "1px 4px", borderRadius: 3, fontWeight: 700 }}>⚠</span>
+                  )}
+                </div>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                 {[
@@ -1130,8 +1167,16 @@ export default function Dashboard() {
             {selectedNode && (
               <div style={{ background: "#111827", borderRadius: 8, padding: 12, border: `1px solid ${ENTITY_COLORS[selectedNode.type] || "#1e293b"}`, animation: "fadeIn 0.2s ease-out" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                  <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.06em", color: ENTITY_COLORS[selectedNode.type], fontWeight: 600, fontFamily: "'IBM Plex Mono', monospace" }}>
+                  <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.06em", color: ENTITY_COLORS[selectedNode.type], fontWeight: 600, fontFamily: "'IBM Plex Mono', monospace", display: "flex", alignItems: "center", gap: 6 }}>
                     {{ Person: "Osoba", Company: "Firma", Institution: "Institucija", Contract: "Ugovor", PoliticalParty: "Stranka" }[selectedNode.type] || selectedNode.type}
+                    {selectedNode.props?.source && (
+                      <span style={{
+                        fontSize: 7, padding: "1px 5px", borderRadius: 3, fontWeight: 700,
+                        background: selectedNode.props.source === 'seed' ? "#f59e0b22" : "#10b98122",
+                        color: selectedNode.props.source === 'seed' ? "#f59e0b" : "#10b981",
+                        border: `1px solid ${selectedNode.props.source === 'seed' ? "#f59e0b55" : "#10b98155"}`,
+                      }}>{selectedNode.props.source === 'seed' ? 'TEST' : selectedNode.props.source.toUpperCase()}</span>
+                    )}
                   </div>
                   <button onClick={clearSelection} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}>×</button>
                 </div>
@@ -1212,12 +1257,15 @@ export default function Dashboard() {
                     const exp = PATTERN_EXPLANATIONS[alert.pattern_type] || {};
                     const color = SEVERITY_COLORS[alert.severity];
                     const moneyVal = alert.contract_value || alert.value_rsd || alert.total_value || alert.donation_amount;
+                    const isTestData = [alert.official_id, alert.family_id, alert.company_mb, alert.contract_id,
+                      alert.person_id, alert.institution_id, alert.winner_mb].some(id => id && String(id).includes('SEED'));
                     return (
                       <div key={i} onClick={() => handleAlertClick(alert)} style={{
                         background: "#111827", borderRadius: 8, padding: "14px 16px",
                         borderLeft: `4px solid ${color}`,
                         cursor: "pointer", transition: "all 0.15s",
                         animation: `fadeIn 0.3s ease-out ${i * 0.04}s both`,
+                        opacity: isTestData ? 0.75 : 1,
                       }}
                         onMouseEnter={e => e.currentTarget.style.background = "#161f30"}
                         onMouseLeave={e => e.currentTarget.style.background = "#111827"}
@@ -1228,6 +1276,9 @@ export default function Dashboard() {
                             <span style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color, fontFamily: "'IBM Plex Mono', monospace" }}>
                               {PATTERN_LABELS[alert.pattern_type] || alert.pattern_type}
                             </span>
+                            {isTestData && (
+                              <span style={{ fontSize: 7, padding: "1px 5px", borderRadius: 3, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44" }}>TEST</span>
+                            )}
                           </div>
                           <RiskBadge level={alert.severity} />
                         </div>
@@ -1243,6 +1294,12 @@ export default function Dashboard() {
                           {alert.donor_company && <span><strong style={{ color: "#3b82f6" }}>{alert.donor_company}</strong> → <strong style={{ color: "#8b5cf6" }}>{alert.party_name}</strong> → {alert.awarding_institution}</span>}
                           {alert.address && <span>Adresa: <strong>{alert.address}</strong> ({alert.num_companies} firmi)</span>}
                           {alert.name_1 && <span><strong>{alert.name_1}</strong> u {alert.institution_1} i {alert.institution_2}</span>}
+                          {alert.pattern_type === 'repeated_winner' && alert.institution && (
+                            <span> — <strong style={{ color: "#10b981" }}>{alert.institution}</strong> ({alert.num_contracts}× ugovora)</span>
+                          )}
+                          {alert.pattern_type === 'new_company_big_contract' && alert.age_at_award != null && (
+                            <span> — osnovana {alert.founded}, ugovor {alert.age_at_award === 0 ? "iste godine" : `za ${alert.age_at_award} god.`}</span>
+                          )}
                         </div>
 
                         {moneyVal && (
@@ -1265,7 +1322,24 @@ export default function Dashboard() {
               <div style={{ padding: 20, overflowY: "auto", height: "100%" }}>
 
                 {/* Data provenance notice */}
-                {sourceCounts["seed"] > 0 && !sourceCounts["apr"] && (
+                {sourceCounts["seed"] > 0 && (sourceCounts["jnportal"] > 0 || sourceCounts["ujn"] > 0) && (
+                  <div style={{
+                    background: "#0a1a0f", border: "1px solid #10b98133", borderRadius: 8,
+                    padding: "12px 14px", marginBottom: 18,
+                    display: "flex", gap: 10, alignItems: "flex-start",
+                  }}>
+                    <span style={{ fontSize: 16, flexShrink: 0 }}>◉</span>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "#10b981", marginBottom: 3 }}>Graf sadrži mešavinu realnih i test podataka</div>
+                      <div style={{ fontSize: 11, color: "#6ee7b7", lineHeight: 1.6 }}>
+                        <strong style={{ color: "#10b981" }}>Realni čvorovi</strong> (puni, bez isprekidanog okvira) potiču iz JN Portala i UJN OpenData.<br />
+                        <strong style={{ color: "#f59e0b" }}>Test čvorovi</strong> (isprekidani zlatni okvir, natpis TEST) su sintetički demonstracioni podaci.<br />
+                        Upozorenja označena sa <span style={{ background: "#f59e0b22", color: "#f59e0b", padding: "0 4px", borderRadius: 2, fontSize: 9, fontFamily: "monospace" }}>TEST</span> uključuju isključivo veštačke entitete.
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {sourceCounts["seed"] > 0 && !sourceCounts["jnportal"] && !sourceCounts["ujn"] && !sourceCounts["apr"] && (
                   <div style={{
                     background: "#1a1208", border: "1px solid #f59e0b44", borderRadius: 8,
                     padding: "12px 14px", marginBottom: 18,
@@ -1275,7 +1349,7 @@ export default function Dashboard() {
                     <div>
                       <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b", marginBottom: 3 }}>Baza sadrži samo sintetičke podatke</div>
                       <div style={{ fontSize: 11, color: "#92400e", lineHeight: 1.6 }}>
-                        Svi čvorovi u grafu su veštački kreirani za demonstraciju. Pravi podaci se skupljaju pokretanjem <code style={{ background: "#231908", padding: "1px 4px", borderRadius: 3, fontFamily: "monospace" }}>POST /ingest/all</code> koji pokušava pristupiti pravim izvorima ispod.
+                        Svi čvorovi u grafu su veštački kreirani za demonstraciju. Pravi podaci se skupljaju pokretanjem <code style={{ background: "#231908", padding: "1px 4px", borderRadius: 3, fontFamily: "monospace" }}>POST /ingest/jnportal</code>.
                       </div>
                     </div>
                   </div>
@@ -1367,10 +1441,17 @@ export default function Dashboard() {
                 background: "#0a1020ee", borderRadius: 8, padding: "6px 12px",
                 border: "1px solid #151d2e", fontSize: 9,
                 fontFamily: "'IBM Plex Mono', monospace", color: "#475569",
-                display: "flex", gap: 12, alignItems: "center",
+                display: "flex", gap: 10, alignItems: "center",
               }}>
-                <span>{nodes.length} čvorova</span><span>·</span>
-                <span>{edges.length} veza</span><span>·</span>
+                {realNodeCount > 0 && (
+                  <span style={{ color: "#10b981" }}>◉ {realNodeCount} realni</span>
+                )}
+                {realNodeCount > 0 && testNodeCount > 0 && <span>+</span>}
+                {testNodeCount > 0 && (
+                  <span style={{ color: "#f59e0b" }}>◌ {testNodeCount} test</span>
+                )}
+                {nodes.length > 0 && <><span>·</span><span>{edges.length} veza</span></>}
+                <span>·</span>
                 <span>Klikni čvor za detalje</span>
                 {isDemo && <><span>·</span><span style={{ color: "#f59e0b" }}>Demo podaci</span></>}
               </div>

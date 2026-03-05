@@ -89,10 +89,10 @@ class JNPortalScraper:
             self._token = self._authenticate()
         return self._token
 
-    def _fetch_page(self, skip: int, take: int, sort_desc: bool = True) -> Dict[str, Any]:
-        """Fetch one page of contracts sorted by value descending."""
+    def _fetch_page(self, skip: int, take: int, sort_field: str = "TotalValue", sort_desc: bool = True) -> Dict[str, Any]:
+        """Fetch one page of contracts with configurable sort field."""
         token = self._get_token()
-        sort_param = json.dumps([{"selector": "TotalValue", "desc": sort_desc}])
+        sort_param = json.dumps([{"selector": sort_field, "desc": sort_desc}])
         params = {
             "take": take,
             "skip": skip,
@@ -107,6 +107,97 @@ class JNPortalScraper:
             r = self.client.get(url, params=params, headers={"UserToken": self._token})
         r.raise_for_status()
         return r.json()
+
+    def _scrape_phase(
+        self,
+        sort_field: str,
+        max_rows: int,
+        min_value: float = 0,
+        require_contractor: bool = False,
+        seen_ids: Optional[set] = None,
+    ) -> List[Dict]:
+        """Fetch up to max_rows contracts with a given sort field.
+
+        If require_contractor=True, skips records without a ContractorName.
+        If min_value > 0, stops when TotalValue drops below threshold.
+        seen_ids: skip contracts already collected in a previous phase.
+        """
+        if seen_ids is None:
+            seen_ids = set()
+
+        contracts: List[Dict] = []
+        institutions_map: Dict[str, Dict] = {}
+        skip = 0
+        page_size = min(JNPORTAL_PAGE_SIZE, max_rows)
+        total_available = None
+        stopped_early = False
+
+        while len(contracts) < max_rows:
+            try:
+                page = self._fetch_page(skip, page_size, sort_field=sort_field)
+            except Exception as e:
+                logger.error("jnportal_page_failed", skip=skip, sort=sort_field, error=str(e))
+                break
+
+            if total_available is None:
+                total_available = page.get("totalCount", 0)
+                logger.info("jnportal_phase_start", sort=sort_field, total=total_available, max_rows=max_rows)
+
+            rows = page.get("data", [])
+            if not rows:
+                break
+
+            for raw in rows:
+                contract_id = f"JNP-{raw.get('Id', '')}"
+                if contract_id in seen_ids:
+                    continue
+
+                value = raw.get("TotalValue") or 0
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    value = 0.0
+
+                if min_value > 0 and value < min_value:
+                    stopped_early = True
+                    break
+
+                contractor_name = (raw.get("ContractorName") or "").strip()
+                if require_contractor and not contractor_name:
+                    continue
+
+                rec = self._parse_contract(raw)
+                if rec:
+                    contracts.append(rec)
+                    seen_ids.add(contract_id)
+
+                # Build institution record
+                inst_pib = re.sub(r"\D", "", str(raw.get("CAIdentificationNumber") or ""))
+                inst_name = (raw.get("CAName") or "").strip()
+                if inst_pib and inst_name and inst_pib not in institutions_map:
+                    institutions_map[inst_pib] = {
+                        "institution_id": f"JNP-INST-{inst_pib}",
+                        "name": inst_name,
+                        "name_normalized": _norm(inst_name),
+                        "maticni_broj": "",
+                        "pib": inst_pib,
+                        "source_url": f"{JNPORTAL_BASE}/contracts",
+                    }
+
+            if stopped_early or len(rows) < page_size:
+                break
+
+            skip += page_size
+            if skip >= (total_available or skip + 1):
+                break
+
+            time.sleep(SCRAPE_DELAY)
+
+        logger.info("jnportal_phase_done",
+                    sort=sort_field,
+                    fetched=len(contracts),
+                    stopped_early=stopped_early)
+        return contracts, institutions_map
 
     def _parse_contract(self, raw: Dict) -> Optional[Dict[str, Any]]:
         """Convert raw API record to our schema."""
@@ -155,8 +246,12 @@ class JNPortalScraper:
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
-        Fetch up to max_rows contracts sorted by value descending.
-        Stops early if contract value drops below min_value.
+        Dual-pass scrape:
+          Phase 1 — sorted by TotalValue DESC, stops at min_value.
+                    Gets all high-value contracts (typically ~700).
+          Phase 2 — sorted by ContractDate DESC, no value filter.
+                    Gets the most recent contracts that have a contractor name,
+                    up to max_rows - phase1_count (deduplicating by contract ID).
         """
         cache_path = os.path.join(DATA_DIR, "raw", "cache", "jnportal_contracts.json")
         if not force_refresh and os.path.exists(cache_path):
@@ -170,64 +265,28 @@ class JNPortalScraper:
                     "scraped_at": "cached",
                 })
 
-        contracts: List[Dict] = []
-        institutions_map: Dict[str, Dict] = {}
-        skip = 0
-        page_size = min(JNPORTAL_PAGE_SIZE, max_rows)
-        total_available = None
-        stopped_early = False
+        # Phase 1: high-value contracts sorted by TotalValue DESC
+        seen_ids: set = set()
+        phase1_contracts, phase1_insts = self._scrape_phase(
+            "TotalValue",
+            max_rows=max_rows,
+            min_value=min_value,
+            require_contractor=False,
+            seen_ids=seen_ids,
+        )
 
-        while len(contracts) < max_rows:
-            try:
-                page = self._fetch_page(skip, page_size)
-            except Exception as e:
-                logger.error("jnportal_page_failed", skip=skip, error=str(e))
-                break
+        # Phase 2: recent contracts sorted by ContractDate DESC
+        remaining = max(0, max_rows - len(phase1_contracts))
+        phase2_contracts, phase2_insts = self._scrape_phase(
+            "ContractDate",
+            max_rows=remaining,
+            min_value=0,
+            require_contractor=True,
+            seen_ids=seen_ids,
+        )
 
-            if total_available is None:
-                total_available = page.get("totalCount", 0)
-                logger.info("jnportal_total_available", total=total_available)
-
-            rows = page.get("data", [])
-            if not rows:
-                break
-
-            for raw in rows:
-                value = raw.get("TotalValue") or 0
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    value = 0.0
-
-                if min_value > 0 and value < min_value:
-                    stopped_early = True
-                    break
-
-                rec = self._parse_contract(raw)
-                if rec:
-                    contracts.append(rec)
-
-                # Build institution record
-                inst_pib = re.sub(r"\D", "", str(raw.get("CAIdentificationNumber") or ""))
-                inst_name = (raw.get("CAName") or "").strip()
-                if inst_pib and inst_name and inst_pib not in institutions_map:
-                    institutions_map[inst_pib] = {
-                        "institution_id": f"JNP-INST-{inst_pib}",
-                        "name": inst_name,
-                        "name_normalized": _norm(inst_name),
-                        "maticni_broj": "",
-                        "pib": inst_pib,
-                        "source_url": f"{JNPORTAL_BASE}/contracts",
-                    }
-
-            if stopped_early or len(rows) < page_size:
-                break
-
-            skip += page_size
-            if skip >= (total_available or skip + 1):
-                break
-
-            time.sleep(SCRAPE_DELAY)
+        contracts = phase1_contracts + phase2_contracts
+        institutions_map = {**phase1_insts, **phase2_insts}
 
         # Save outputs
         out_contracts = os.path.join(DATA_DIR, "raw", "ujn", "jnportal_contracts.json")
@@ -237,11 +296,11 @@ class JNPortalScraper:
         with open(out_institutions, "w", encoding="utf-8") as f:
             json.dump(list(institutions_map.values()), f, ensure_ascii=False, indent=2)
 
-        # Cache summary
         summary = {
             "total_contracts": len(contracts),
             "total_institutions": len(institutions_map),
-            "stopped_early_below_min_value": stopped_early,
+            "phase1_by_value": len(phase1_contracts),
+            "phase2_by_date": len(phase2_contracts),
             "min_value_rsd": min_value,
             "max_rows": max_rows,
             "scraped_at": datetime.utcnow().isoformat(),
@@ -250,7 +309,8 @@ class JNPortalScraper:
             json.dump({"summary": summary, "contracts": contracts[:10]}, f)
 
         logger.info("jnportal_done",
-                    contracts=len(contracts),
-                    institutions=len(institutions_map),
-                    stopped_early=stopped_early)
+                    total=len(contracts),
+                    phase1=len(phase1_contracts),
+                    phase2=len(phase2_contracts),
+                    institutions=len(institutions_map))
         return summary
