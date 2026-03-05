@@ -733,6 +733,7 @@ export default function Dashboard() {
   const [edges, setEdges] = useState(DEMO_EDGES);
   const [alerts, setAlerts] = useState(DEMO_ALERTS);
   const [stats, setStats] = useState(null);
+  const [flaggedCounts, setFlaggedCounts] = useState(null); // counts from /graph/suspicious
   const [sourceCounts, setSourceCounts] = useState({});
   const [riskSummary, setRiskSummary] = useState(null);
 
@@ -745,18 +746,22 @@ export default function Dashboard() {
         setStats(statsData);
         setIsDemo(false);
 
-        // Load source counts, graph overview, and detections in parallel
+        // Load source counts, SUSPICIOUS graph only, and detections in parallel
         const [srcData, graphData, detectData] = await Promise.all([
           apiFetch("/stats/sources"),
-          apiFetch("/graph/overview?limit=200"),
+          apiFetch("/graph/suspicious?limit=300"),
           apiFetch("/detect/all"),
         ]);
 
         if (!cancelled) {
           if (srcData?.by_source) setSourceCounts(srcData.by_source);
-          if (graphData?.nodes?.length) {
-            setNodes(graphData.nodes);
-            setEdges(graphData.edges || []);
+          if (graphData) {
+            // Store flagged entity counts for sidebar (these are the only counts that matter)
+            if (graphData.flagged_counts) setFlaggedCounts(graphData.flagged_counts);
+            if (graphData.nodes?.length) {
+              setNodes(graphData.nodes);
+              setEdges(graphData.edges || []);
+            }
           }
           if (detectData) {
             setRiskSummary(detectData.risk_summary);
@@ -1047,14 +1052,23 @@ export default function Dashboard() {
           {/* Sidebar */}
           <aside style={{ width: 270, borderRight: "1px solid #151d2e", padding: 14, overflowY: "auto", flexShrink: 0, background: "#0a1020" }}>
             <div style={{ marginBottom: 18 }}>
-              <div style={{ fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.12em", color: "#475569", marginBottom: 8, fontFamily: "'IBM Plex Mono', monospace" }}>Pregled baze</div>
+              <div style={{ fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.12em", color: "#475569", marginBottom: 4, fontFamily: "'IBM Plex Mono', monospace", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>Pregled baze</span>
+                {!isDemo && flaggedCounts != null && (
+                  <span style={{ fontSize: 8, color: "#dc2626", background: "#dc262615", padding: "1px 5px", borderRadius: 3, fontWeight: 700 }}>⚠ SUMNJIVI</span>
+                )}
+              </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                 {[
-                  { label: "Osobe", value: stats?.total_persons, color: ENTITY_COLORS.Person, type: "Person" },
-                  { label: "Firme", value: stats?.total_companies, color: ENTITY_COLORS.Company, type: "Company" },
-                  { label: "Ugovori", value: stats?.total_contracts, color: ENTITY_COLORS.Contract, type: "Contract" },
-                  { label: "Institucije", value: stats?.total_institutions, color: ENTITY_COLORS.Institution, type: "Institution" },
-                ].map(s => (
+                  { label: "Osobe", flagged: flaggedCounts?.persons, total: stats?.total_persons, color: ENTITY_COLORS.Person, type: "Person" },
+                  { label: "Firme", flagged: flaggedCounts?.companies, total: stats?.total_companies, color: ENTITY_COLORS.Company, type: "Company" },
+                  { label: "Ugovori", flagged: flaggedCounts?.contracts, total: stats?.total_contracts, color: ENTITY_COLORS.Contract, type: "Contract" },
+                  { label: "Institucije", flagged: flaggedCounts?.institutions, total: stats?.total_institutions, color: ENTITY_COLORS.Institution, type: "Institution" },
+                ].map(s => {
+                  // Primary value: flagged count if available and real data loaded, else total
+                  const primaryVal = (!isDemo && flaggedCounts != null) ? (s.flagged ?? 0) : s.total;
+                  const showTotal = !isDemo && flaggedCounts != null && s.total != null && s.total !== primaryVal;
+                  return (
                   <div key={s.label}
                     onClick={() => !isDemo && setEntityBrowser({ type: s.type, label: s.label, color: s.color })}
                     style={{
@@ -1067,13 +1081,15 @@ export default function Dashboard() {
                     onMouseEnter={e => { if (!isDemo) e.currentTarget.style.background = "#161f30"; }}
                     onMouseLeave={e => e.currentTarget.style.background = "#111827"}
                   >
-                    <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: s.color }}>{loading ? "…" : (s.value ?? "—")}</div>
-                    <div style={{ fontSize: 9, color: "#64748b", marginTop: 2, display: "flex", justifyContent: "space-between" }}>
-                      <span>{s.label}</span>
-                      {!isDemo && <span style={{ color: "#334155" }}>↗</span>}
+                    <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: s.color }}>{loading ? "…" : (primaryVal ?? "—")}</div>
+                    <div style={{ fontSize: 9, color: "#64748b", marginTop: 2, display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+                      <span>{s.label}{!isDemo && flaggedCounts != null ? " ⚠" : ""}</span>
+                      {showTotal && <span style={{ color: "#1e3a5f", fontSize: 8 }}>/{s.total} ukupno</span>}
+                      {!showTotal && !isDemo && <span style={{ color: "#334155" }}>↗</span>}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
 
               <div style={{ background: "#111827", borderRadius: 8, padding: "10px 12px", marginTop: 6, borderLeft: `3px solid ${SEVERITY_COLORS[riskSummary?.risk_level || "low"]}` }}>
