@@ -1,294 +1,292 @@
 """
-UJN Procurement Bulk Scraper
-Downloads real procurement data from portal.ujn.gov.rs open data files.
+UJN Procurement OpenData Bulk Scraper
 
-Working URLs (confirmed):
-  http://portal.ujn.gov.rs/OpenD/OpenData_2020.xlsx  (36k rows, 10.4 MB)
-  http://portal.ujn.gov.rs/OpenD/OpenData_2019.xlsx  (13.4 MB)
-  http://portal.ujn.gov.rs/OpenD/OpenData_2018.csv   (38.2 MB, 61k rows)
+Goals:
+- Pull newest available years automatically (PROCUREMENT_YEARS=last:2 by default).
+- Download OpenData_<YEAR>.xlsx or OpenData_<YEAR>.csv from portal.ujn.gov.rs/OpenD
+- Cache downloads, allow force_refresh.
+- Parse to JSON outputs expected by GraphLoader:
+  - data/raw/institutions/ujn_<YEAR>.json
+  - data/raw/ujn/procurements_<YEAR>.json
 
-Data structure: procurement notices with real institution names + maticni_broj.
-Contract award decisions (OdlukaODodeliUgovora=1) have linked pages.
+Important:
+- Column names vary. We use normalized header matching and multiple fallbacks.
+- If supplier fields exist in the OpenData file, we store:
+  supplier_name, supplier_mb
+so GraphLoader can create Company and WON_CONTRACT relationships.
 """
+
 import os
-import json
-import csv
 import io
+import re
+import csv
+import json
 import time
 import unicodedata
-from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import Optional
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Any
 
 import httpx
 import structlog
 
 logger = structlog.get_logger()
 
-DELAY = float(os.getenv("SCRAPE_DELAY", "2"))
 DATA_DIR = os.getenv("DATA_DIR", "./data")
+SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "2"))
+SCRAPER_TIMEOUT = float(os.getenv("SCRAPER_TIMEOUT", "180"))
+USER_AGENT = os.getenv("SCRAPER_UA", "SrpskaTransparentnost/1.0 (+local)")
 
-# Confirmed working open data files
-OPEN_DATA_URLS = [
-    ("2020", "http://portal.ujn.gov.rs/OpenD/OpenData_2020.xlsx", "xlsx"),
-    ("2019", "http://portal.ujn.gov.rs/OpenD/OpenData_2019.xlsx", "xlsx"),
-    ("2018", "http://portal.ujn.gov.rs/OpenD/OpenData_2018.csv", "csv"),
-]
-
-# Only download 2020 by default (fastest, still recent)
-DEFAULT_YEAR = "2020"
+BASE = os.getenv("UJN_OPEND_BASE", "http://portal.ujn.gov.rs/OpenD").rstrip("/")
+PROCUREMENT_YEARS = os.getenv("PROCUREMENT_YEARS", "last:2")
+PROCUREMENT_MAX_ROWS = int(os.getenv("PROCUREMENT_MAX_ROWS", "3000"))
 
 
-@dataclass
-class InstitutionRecord:
-    institution_id: str
-    name: str
-    name_normalized: str
-    maticni_broj: str
-    pib: Optional[str]
-    city: Optional[str]
-    source: str = "ujn"
-    source_url: str = "http://portal.ujn.gov.rs/OpenD/"
-    scraped_at: str = ""
-
-    def __post_init__(self):
-        if not self.scraped_at:
-            self.scraped_at = datetime.utcnow().isoformat()
+def _ensure_dirs():
+    os.makedirs(os.path.join(DATA_DIR, "raw", "ujn"), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "raw", "institutions"), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "raw", "cache"), exist_ok=True)
 
 
-@dataclass
-class ProcurementRecord:
-    contract_id: str
-    title: str
-    subject: str
-    institution_mb: str
-    institution_name: str
-    proc_type: Optional[str]
-    subject_type: Optional[str]
-    date_modified: Optional[str]
-    detail_url: str
-    has_award_decision: bool
-    source: str = "ujn"
-    scraped_at: str = ""
-
-    def __post_init__(self):
-        if not self.scraped_at:
-            self.scraped_at = datetime.utcnow().isoformat()
-
-
-def _normalize(text: str) -> str:
-    """Normalize Serbian text to ASCII for matching."""
-    if not text:
+def _norm(s: str) -> str:
+    if s is None:
         return ""
-    # Replace Cyrillic
-    cyrillic_map = {
-        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
-        'ж': 'z', 'з': 'z', 'и': 'i', 'ј': 'j', 'к': 'k', 'л': 'l',
-        'љ': 'lj', 'м': 'm', 'н': 'n', 'њ': 'nj', 'о': 'o', 'п': 'p',
-        'р': 'r', 'с': 's', 'т': 't', 'ћ': 'c', 'ч': 'c', 'у': 'u',
-        'ф': 'f', 'х': 'h', 'ц': 'c', 'џ': 'dz', 'ш': 's', 'ђ': 'dj',
-        'А': 'a', 'Б': 'b', 'В': 'v', 'Г': 'g', 'Д': 'd', 'Е': 'e',
-        'Ж': 'z', 'З': 'z', 'И': 'i', 'Ј': 'j', 'К': 'k', 'Л': 'l',
-        'Љ': 'lj', 'М': 'm', 'Н': 'n', 'Њ': 'nj', 'О': 'o', 'П': 'p',
-        'Р': 'r', 'С': 's', 'Т': 't', 'Ћ': 'c', 'Ч': 'c', 'У': 'u',
-        'Ф': 'f', 'Х': 'h', 'Ц': 'c', 'Џ': 'dz', 'Ш': 's', 'Ђ': 'dj',
-    }
-    result = ""
-    for ch in text:
-        result += cyrillic_map.get(ch, ch)
-    # Strip diacritics
-    result = unicodedata.normalize('NFKD', result)
-    result = ''.join(c for c in result if not unicodedata.combining(c))
-    return result.lower().strip()
+    s = str(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _digits_only(s: str) -> str:
+    if s is None:
+        return ""
+    return re.sub(r"\D+", "", str(s))
+
+
+def _resolve_years(spec: str) -> List[str]:
+    spec = (spec or "").strip()
+    now_year = datetime.utcnow().year
+    if spec.startswith("last:"):
+        n = int(spec.split(":", 1)[1])
+        return [str(now_year - i) for i in range(n)]
+    years = [y.strip() for y in spec.split(",") if y.strip()]
+    years = sorted(set(years), reverse=True)
+    return years
+
+
+def _candidate_urls(year: str) -> List[Tuple[str, str]]:
+    return [
+        (f"{BASE}/OpenData_{year}.xlsx", "xlsx"),
+        (f"{BASE}/OpenData_{year}.csv", "csv"),
+    ]
 
 
 class ProcurementBulkScraper:
-    """Downloads UJN open data files and extracts institution + procurement data."""
-
     def __init__(self):
+        _ensure_dirs()
         self.client = httpx.Client(
-            timeout=180.0,
+            timeout=SCRAPER_TIMEOUT,
             follow_redirects=True,
-            headers={"User-Agent": "SrpskaTransparentnost/1.0 (+https://transparentnost.rs)"},
+            headers={"User-Agent": USER_AGENT},
         )
-        os.makedirs(f"{DATA_DIR}/raw/ujn", exist_ok=True)
-        os.makedirs(f"{DATA_DIR}/raw/institutions", exist_ok=True)
 
-    def _download_xlsx(self, url: str, year: str) -> Optional[bytes]:
-        cache_path = f"{DATA_DIR}/raw/ujn/opendata_{year}.xlsx"
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100_000:
-            logger.info("ujn_cache_hit", year=year)
-            with open(cache_path, "rb") as f:
-                return f.read()
-        logger.info("ujn_download_start", url=url, year=year)
-        try:
-            resp = self.client.get(url)
-            if resp.status_code != 200:
-                logger.error("ujn_download_failed", status=resp.status_code, url=url)
-                return None
-            data = resp.content
-            with open(cache_path, "wb") as f:
-                f.write(data)
-            logger.info("ujn_download_done", year=year, size_mb=round(len(data) / 1e6, 1))
-            return data
-        except Exception as e:
-            logger.error("ujn_download_error", error=str(e))
-            return None
+    def _download_cached(self, url: str, cache_name: str, force_refresh: bool) -> bytes:
+        cache_path = os.path.join(DATA_DIR, "raw", "cache", cache_name)
+        if not force_refresh and os.path.exists(cache_path) and os.path.getsize(cache_path) > 1000:
+            logger.info("ujn_cache_hit", file=cache_name)
+            return open(cache_path, "rb").read()
 
-    def _download_csv(self, url: str, year: str) -> Optional[str]:
-        cache_path = f"{DATA_DIR}/raw/ujn/opendata_{year}.csv"
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100_000:
-            logger.info("ujn_csv_cache_hit", year=year)
-            with open(cache_path, "r", encoding="utf-8-sig") as f:
-                return f.read()
-        logger.info("ujn_csv_download_start", url=url, year=year)
-        try:
-            resp = self.client.get(url)
-            if resp.status_code != 200:
-                logger.error("ujn_csv_download_failed", status=resp.status_code)
-                return None
-            # Try UTF-8 with BOM first, fall back to windows-1250
+        logger.info("ujn_download", url=url, file=cache_name)
+        r = self.client.get(url)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code} for {url}")
+        data = r.content
+        with open(cache_path, "wb") as f:
+            f.write(data)
+        time.sleep(SCRAPE_DELAY)
+        return data
+
+    def _probe_year(self, year: str) -> Optional[Tuple[str, str, bytes]]:
+        for url, fmt in _candidate_urls(year):
             try:
-                text = resp.content.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                text = resp.content.decode("windows-1250", errors="replace")
-            with open(cache_path, "w", encoding="utf-8") as f:
-                f.write(text)
-            logger.info("ujn_csv_download_done", year=year, size_mb=round(len(resp.content) / 1e6, 1))
-            return text
-        except Exception as e:
-            logger.error("ujn_csv_download_error", error=str(e))
-            return None
+                data = self._download_cached(url, f"OpenData_{year}.{fmt}", force_refresh=False)
+                return url, fmt, data
+            except Exception:
+                continue
+        return None
 
-    def _parse_xlsx(self, data: bytes, year: str):
-        """Parse XLSX and yield row dicts."""
-        try:
-            import openpyxl
-            from io import BytesIO
-            wb = openpyxl.load_workbook(BytesIO(data), read_only=True)
-            ws = wb.active
-            headers = [str(c.value) if c.value else "" for c in next(ws.iter_rows(max_row=1))]
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                yield dict(zip(headers, row))
-            wb.close()
-        except ImportError:
-            logger.error("openpyxl_not_installed")
+    @staticmethod
+    def _find_header(headers_norm: List[str], patterns: List[str]) -> Optional[int]:
+        for p in patterns:
+            for i, h in enumerate(headers_norm):
+                if p in h:
+                    return i
+        return None
 
-    def _parse_csv_rows(self, text: str):
-        """Parse CSV and yield row dicts."""
-        reader = csv.DictReader(io.StringIO(text))
-        for row in reader:
-            yield row
-
-    def _row_to_records(self, row: dict, year: str):
-        """Convert a UJN data row to InstitutionRecord + ProcurementRecord."""
-        # Institution
-        mb = str(row.get("MaticniBroj") or row.get("MaticniBroj") or "").strip()
-        name = str(row.get("Naziv") or row.get("NazivNarucioca") or "").strip()
-        if not mb or not name or mb == "None":
-            return None, None
-
-        inst = InstitutionRecord(
-            institution_id=f"INST-UJN-{mb}",
-            name=name,
-            name_normalized=_normalize(name),
-            maticni_broj=mb,
-            pib=str(row.get("PIB") or "").strip() or None,
-            city=None,
-            source_url=f"http://portal.ujn.gov.rs/OpenD/OpenData_{year}.xlsx",
-        )
-
-        # Procurement notice
-        doc_id = str(row.get("ID_Dokument") or row.get("SifraNabavke") or "").strip()
-        title = str(row.get("NazivDokumenta") or "").strip()
-        subject = str(row.get("PredmetNabavke") or "").strip()
-        link = str(row.get("Link") or "").strip()
-
-        has_award = str(row.get("OdlukaODodeliUgovora") or "0").strip() == "1"
-
-        if not doc_id:
-            return inst, None
-
-        proc = ProcurementRecord(
-            contract_id=f"PROC-UJN-{doc_id}",
-            title=title[:200] if title else subject[:200],
-            subject=subject[:300] if subject else "",
-            institution_mb=mb,
-            institution_name=name,
-            proc_type=str(row.get("IdVrstaPostupka") or "").strip() or None,
-            subject_type=str(row.get("VrstaPredmeta") or "").strip() or None,
-            date_modified=str(row.get("DatumPoslednjeIzmene") or "").strip() or None,
-            detail_url=link,
-            has_award_decision=has_award,
-        )
-        return inst, proc
-
-    def scrape(self, year: str = DEFAULT_YEAR, max_rows: int = 5000) -> tuple[list, list]:
+    def _parse_rows(self, fmt: str, payload: bytes, max_rows: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
-        Download UJN open data for a given year and extract institutions + procurements.
-        Returns (institutions, procurements).
-        max_rows: cap on how many procurement rows to load (institutions are always deduped).
+        Returns: (procurements, institutions)
         """
-        # Find URL for year
-        url, fmt = None, None
-        for y, u, f in OPEN_DATA_URLS:
-            if y == year:
-                url, fmt = u, f
-                break
-        if not url:
-            logger.error("ujn_unknown_year", year=year)
-            return [], []
+        rows: List[Dict[str, Any]] = []
 
-        # Download
         if fmt == "xlsx":
-            data = self._download_xlsx(url, year)
-            if not data:
-                return [], []
-            rows = self._parse_xlsx(data, year)
-        else:
-            text = self._download_csv(url, year)
-            if not text:
-                return [], []
-            rows = self._parse_csv_rows(text)
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(payload), read_only=True)
+            ws = wb.active
+            headers = [str(c.value).strip() if c.value is not None else "" for c in next(ws.iter_rows(max_row=1))]
+            headers_norm = [_norm(h) for h in headers]
 
-        institutions: dict[str, InstitutionRecord] = {}
-        procurements: list[ProcurementRecord] = []
-        award_only_procs = []
-        total = 0
+            for r_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
+                if r_idx > max_rows:
+                    break
+                rowd = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+                rows.append(rowd)
+
+            wb.close()
+
+        elif fmt == "csv":
+            text = payload.decode("utf-8", errors="replace")
+            reader = csv.DictReader(text.splitlines())
+            for r_idx, row in enumerate(reader, start=1):
+                if r_idx > max_rows:
+                    break
+                rows.append(row)
+
+            headers = list(rows[0].keys()) if rows else []
+            headers_norm = [_norm(h) for h in headers]
+        else:
+            raise ValueError(f"Unsupported format: {fmt}")
+
+        # Heuristic column mapping
+        # Contract id fields
+        contract_id_idx = self._find_header(headers_norm, [
+            "broj obavestenja", "broj obaveštenja",
+            "id", "sifra", "šifra", "oznaka",
+            "broj postupka", "broj nabavke", "ref. br",
+        ])
+        title_idx = self._find_header(headers_norm, ["predmet", "naziv", "opis", "subject", "title"])
+        inst_name_idx = self._find_header(headers_norm, ["narucilac naziv", "naručilac naziv", "narucilac", "naručilac"])
+        inst_mb_idx = self._find_header(headers_norm, ["narucilac maticni", "naručilac matični", "maticni broj narucioca", "matični broj naručioca", "mb narucioca"])
+        supplier_name_idx = self._find_header(headers_norm, ["ugovorna strana", "ponudjac", "ponuđač", "dobavljac", "dobavljač", "izabrani ponudjac", "izabrani ponuđač"])
+        supplier_mb_idx = self._find_header(headers_norm, ["maticni broj ponudjaca", "matični broj ponuđača", "mb ponudjaca", "mb ponuđača", "maticni broj dobavljaca", "matični broj dobavljača"])
+        value_idx = self._find_header(headers_norm, ["ukupni iznos", "ukupna vrednost", "ugovoreni iznos", "vrednost", "iznos"])
+        date_idx = self._find_header(headers_norm, ["datum", "date", "objavljeno", "zakljucenja", "zaključenja"])
+
+        # Build procurement records
+        procurements: List[Dict[str, Any]] = []
+        institutions_map: Dict[str, Dict[str, Any]] = {}
 
         for row in rows:
-            total += 1
-            inst, proc = self._row_to_records(row, year)
-            if inst and inst.maticni_broj not in institutions:
-                institutions[inst.maticni_broj] = inst
-            if proc:
-                if proc.has_award_decision:
-                    award_only_procs.append(proc)
-                elif len(procurements) < max_rows // 2:
-                    procurements.append(proc)
+            # Convert row to list by headers order so idx lookups work for csv too
+            row_list = [row.get(h) for h in headers]
 
-        # Prioritize award decisions
-        procurements = award_only_procs[:max_rows] + procurements[:max(0, max_rows - len(award_only_procs))]
+            raw_cid = row_list[contract_id_idx] if contract_id_idx is not None else None
+            title = row_list[title_idx] if title_idx is not None else None
 
-        logger.info("ujn_parse_done",
-                    year=year,
-                    total_rows=total,
-                    unique_institutions=len(institutions),
-                    procurements=len(procurements),
-                    award_decisions=len(award_only_procs))
+            # If we cannot identify contract id or title, skip
+            cid = str(raw_cid).strip() if raw_cid is not None else ""
+            title_s = str(title).strip() if title is not None else ""
+            if not cid or not title_s or title_s == "None":
+                continue
 
-        # Save institutions
-        inst_list = list(institutions.values())
-        inst_path = f"{DATA_DIR}/raw/institutions/ujn_{year}.json"
-        with open(inst_path, "w", encoding="utf-8") as f:
-            json.dump([asdict(i) for i in inst_list], f, ensure_ascii=False, indent=2)
+            inst_name = str(row_list[inst_name_idx]).strip() if inst_name_idx is not None and row_list[inst_name_idx] is not None else ""
+            inst_mb = _digits_only(row_list[inst_mb_idx]) if inst_mb_idx is not None else ""
 
-        # Save procurements
-        proc_path = f"{DATA_DIR}/raw/ujn/procurements_{year}.json"
-        with open(proc_path, "w", encoding="utf-8") as f:
-            json.dump([asdict(p) for p in procurements], f, ensure_ascii=False, indent=2)
+            supplier_name = str(row_list[supplier_name_idx]).strip() if supplier_name_idx is not None and row_list[supplier_name_idx] is not None else ""
+            supplier_mb = _digits_only(row_list[supplier_mb_idx]) if supplier_mb_idx is not None else ""
 
-        return inst_list, procurements
+            val_raw = row_list[value_idx] if value_idx is not None else None
+            value = None
+            if val_raw is not None:
+                s = str(val_raw)
+                s = s.replace(".", "").replace(",", ".")
+                m = re.search(r"([0-9]+(\.[0-9]+)?)", s)
+                if m:
+                    try:
+                        value = float(m.group(1))
+                    except Exception:
+                        value = None
 
-    def close(self):
-        self.client.close()
+            date_modified = str(row_list[date_idx]).strip() if date_idx is not None and row_list[date_idx] is not None else ""
+
+            rec = {
+                "contract_id": cid,
+                "title": title_s,
+                "subject": title_s,
+                "proc_type": "",
+                "subject_type": "",
+                "date_modified": date_modified,
+                "has_award_decision": True if supplier_name or supplier_mb else False,
+                "detail_url": "",
+                "institution_mb": inst_mb,
+                "institution_name": inst_name,
+                "supplier_name": supplier_name or None,
+                "supplier_mb": supplier_mb or None,
+                "contract_value": value,
+                "currency": "RSD",
+                "source": "ujn_opend",
+            }
+            procurements.append(rec)
+
+            if inst_mb and inst_name:
+                institutions_map[inst_mb] = {
+                    "institution_id": f"UJN-INST-{inst_mb}",
+                    "name": inst_name,
+                    "name_normalized": _norm(inst_name),
+                    "maticni_broj": inst_mb,
+                    "pib": "",
+                    "source_url": f"http://portal.ujn.gov.rs/Pretrage/Narucilac.aspx?mb={inst_mb}",
+                }
+
+        return procurements, list(institutions_map.values())
+
+    def scrape(self, years: Optional[str] = None, max_rows: Optional[int] = None, force_refresh: bool = False) -> Dict[str, Any]:
+        years_spec = years or PROCUREMENT_YEARS
+        max_rows = max_rows if max_rows is not None else PROCUREMENT_MAX_ROWS
+
+        summary: Dict[str, Any] = {
+            "years": [],
+            "total_procurements": 0,
+            "total_institutions": 0,
+            "scraped_at": datetime.utcnow().isoformat(),
+        }
+
+        for y in _resolve_years(years_spec):
+            found = None
+            last_error = None
+
+            for url, fmt in _candidate_urls(y):
+                try:
+                    payload = self._download_cached(url, f"OpenData_{y}.{fmt}", force_refresh=force_refresh)
+                    found = (url, fmt, payload)
+                    break
+                except Exception as e:
+                    last_error = str(e)
+
+            if not found:
+                logger.warning("ujn_year_not_available", year=y, error=last_error)
+                summary["years"].append({"year": y, "available": False, "error": last_error})
+                continue
+
+            url, fmt, payload = found
+            procs, insts = self._parse_rows(fmt, payload, max_rows=max_rows)
+
+            out_proc = os.path.join(DATA_DIR, "raw", "ujn", f"procurements_{y}.json")
+            out_inst = os.path.join(DATA_DIR, "raw", "institutions", f"ujn_{y}.json")
+
+            with open(out_proc, "w", encoding="utf-8") as f:
+                json.dump(procs, f, ensure_ascii=False, indent=2)
+
+            with open(out_inst, "w", encoding="utf-8") as f:
+                json.dump(insts, f, ensure_ascii=False, indent=2)
+
+            logger.info("ujn_year_done", year=y, fmt=fmt, procurements=len(procs), institutions=len(insts))
+            summary["years"].append(
+                {"year": y, "available": True, "fmt": fmt, "url": url, "procurements": len(procs), "institutions": len(insts)}
+            )
+            summary["total_procurements"] += len(procs)
+            summary["total_institutions"] += len(insts)
+
+        return summary

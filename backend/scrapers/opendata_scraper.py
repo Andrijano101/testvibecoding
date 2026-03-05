@@ -1,47 +1,39 @@
 """
-data.gov.rs Open Data Scraper
-Uses the udata REST API at https://data.gov.rs/api/1/
+data.gov.rs Open Data Scraper (udata API)
 
-NOTE: data.gov.rs runs udata, NOT CKAN.
-Correct API base: /api/1/  (not /api/3/action/)
+Key behavior:
+- No hardcoded timestamped file URLs.
+- Fetch dataset metadata, choose the newest resource (prefer xlsx, then csv).
+- Cache downloads; allow force_refresh.
 
-Confirmed working endpoints:
-  GET /api/1/datasets/?tag=budzet&page_size=50
-  GET /api/1/datasets/politichke-stranke/
-  Direct file downloads: https://data.gov.rs/s/resources/...
+Outputs:
+- data/raw/opendata/parties.json
+- data/raw/opendata/parties_source.json
 """
+
 import os
-import json
 import io
+import json
 import time
-from datetime import datetime
+import re
+import unicodedata
 from dataclasses import dataclass, asdict
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
 
 import httpx
 import structlog
 
 logger = structlog.get_logger()
 
-UDATA_API = "https://data.gov.rs/api/1"
-DELAY = float(os.getenv("SCRAPE_DELAY", "2"))
+UDATA_API = os.getenv("UDATA_API", "https://data.gov.rs/api/1").rstrip("/")
 DATA_DIR = os.getenv("DATA_DIR", "./data")
+SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "2"))
+SCRAPER_TIMEOUT = float(os.getenv("SCRAPER_TIMEOUT", "120"))
+USER_AGENT = os.getenv("SCRAPER_UA", "SrpskaTransparentnost/1.0 (+local)")
 
-# Confirmed slugs and file URLs from API inspection
-KNOWN_DATASETS = {
-    "political_parties": {
-        "slug": "politichke-stranke",
-        "file_url": "https://data.gov.rs/s/resources/politichke-stranke/20240202-134344/politicke-stranke.xlsx",
-        "format": "xlsx",
-        "description": "Registar političkih stranaka u Srbiji (MUP)",
-    },
-    "procurement_notices": {
-        "slug": "podatsi-iz-oglasa-javnikh-nabavki-sa-portala-javnikh-nabavki",
-        "file_url": "http://portal.ujn.gov.rs/OpenD/OpenData_2020.xlsx",
-        "format": "xlsx",
-        "description": "Podaci iz oglasa javnih nabavki (UJN 2020)",
-    },
-}
+# Dataset slug for political parties (udata)
+PARTIES_DATASET_SLUG = os.getenv("PARTIES_DATASET_SLUG", "politichke-stranke")
 
 
 @dataclass
@@ -65,200 +57,197 @@ class PoliticalPartyRecord:
 
 
 def _normalize(text: str) -> str:
-    import unicodedata
     if not text:
         return ""
-    cyrillic_map = {
-        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
-        'ж': 'z', 'з': 'z', 'и': 'i', 'ј': 'j', 'к': 'k', 'л': 'l',
-        'љ': 'lj', 'м': 'm', 'н': 'n', 'њ': 'nj', 'о': 'o', 'п': 'p',
-        'р': 'r', 'с': 's', 'т': 't', 'ћ': 'c', 'ч': 'c', 'у': 'u',
-        'ф': 'f', 'х': 'h', 'ц': 'c', 'џ': 'dz', 'ш': 's', 'ђ': 'dj',
-        'А': 'a', 'Б': 'b', 'В': 'v', 'Г': 'g', 'Д': 'd', 'Е': 'e',
-        'Ж': 'z', 'З': 'z', 'И': 'i', 'Ј': 'j', 'К': 'k', 'Л': 'l',
-        'Љ': 'lj', 'М': 'm', 'Н': 'n', 'Њ': 'nj', 'О': 'o', 'П': 'p',
-        'Р': 'r', 'С': 's', 'Т': 't', 'Ћ': 'c', 'Ч': 'c', 'У': 'u',
-        'Ф': 'f', 'Х': 'h', 'Ц': 'c', 'Џ': 'dz', 'Ш': 's', 'Ђ': 'dj',
+    # Basic Cyrillic to Latin mapping for Serbian
+    cyr = {
+        'а':'a','б':'b','в':'v','г':'g','д':'d','ђ':'dj','е':'e','ж':'z','з':'z','и':'i','ј':'j',
+        'к':'k','л':'l','љ':'lj','м':'m','н':'n','њ':'nj','о':'o','п':'p','р':'r','с':'s','т':'t',
+        'ћ':'c','у':'u','ф':'f','х':'h','ц':'c','ч':'c','џ':'dz','ш':'s',
+        'А':'a','Б':'b','В':'v','Г':'g','Д':'d','Ђ':'dj','Е':'e','Ж':'z','З':'z','И':'i','Ј':'j',
+        'К':'k','Л':'l','Љ':'lj','М':'m','Н':'n','Њ':'nj','О':'o','П':'p','Р':'r','С':'s','Т':'t',
+        'Ћ':'c','У':'u','Ф':'f','Х':'h','Ц':'c','Ч':'c','Џ':'dz','Ш':'s',
     }
-    result = ""
-    for ch in text:
-        result += cyrillic_map.get(ch, ch)
-    result = unicodedata.normalize('NFKD', result)
-    result = ''.join(c for c in result if not unicodedata.combining(c))
-    return result.lower().strip()
+    out = "".join(cyr.get(ch, ch) for ch in text)
+    out = unicodedata.normalize("NFKD", out)
+    out = "".join(c for c in out if not unicodedata.combining(c))
+    return out.lower().strip()
 
 
-def _slug(text: str) -> str:
-    import re
-    n = _normalize(text)
-    n = re.sub(r'[^a-z0-9]+', '-', n)
-    return n.strip('-')[:60]
+def _slugify(text: str) -> str:
+    t = _normalize(text)
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+    return t[:80] if t else "party"
+
+
+def _ensure_dirs():
+    os.makedirs(os.path.join(DATA_DIR, "raw", "opendata"), exist_ok=True)
 
 
 class OpenDataScraper:
-    """Scrapes data.gov.rs using the udata REST API (/api/1/)."""
-
     def __init__(self):
+        _ensure_dirs()
         self.client = httpx.Client(
-            timeout=120.0,
+            timeout=SCRAPER_TIMEOUT,
             follow_redirects=True,
-            headers={"User-Agent": "SrpskaTransparentnost/1.0 (+https://transparentnost.rs)"},
+            headers={"User-Agent": USER_AGENT},
         )
-        os.makedirs(f"{DATA_DIR}/raw/opendata", exist_ok=True)
 
-    def _get_dataset_info(self, slug: str) -> Optional[dict]:
-        """Fetch dataset metadata from udata API."""
-        try:
-            resp = self.client.get(f"{UDATA_API}/datasets/{slug}/")
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("udata_dataset_not_found", slug=slug, status=resp.status_code)
-            return None
-        except Exception as e:
-            logger.error("udata_api_error", error=str(e))
-            return None
+    def _get_dataset(self, slug: str) -> Dict:
+        url = f"{UDATA_API}/datasets/{slug}/"
+        r = self.client.get(url)
+        r.raise_for_status()
+        return r.json()
 
-    def _download_file(self, url: str, local_name: str) -> Optional[bytes]:
-        """Download a file with caching."""
-        cache_path = f"{DATA_DIR}/raw/opendata/{local_name}"
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1000:
-            logger.info("opendata_cache_hit", file=local_name)
-            with open(cache_path, "rb") as f:
-                return f.read()
-        logger.info("opendata_download", url=url)
-        try:
-            resp = self.client.get(url)
-            if resp.status_code != 200:
-                logger.error("opendata_download_failed", url=url, status=resp.status_code)
-                return None
-            data = resp.content
-            with open(cache_path, "wb") as f:
-                f.write(data)
-            logger.info("opendata_download_done", file=local_name, size=len(data))
-            return data
-        except Exception as e:
-            logger.error("opendata_download_error", error=str(e))
-            return None
-
-    def fetch_political_parties(self) -> list[PoliticalPartyRecord]:
+    @staticmethod
+    def _pick_newest_resource(resources: List[Dict]) -> Tuple[Dict, str]:
         """
-        Download political parties register from data.gov.rs.
-        Source: MUP register of political parties, updated 2024-02-02.
-        URL: https://data.gov.rs/s/resources/politichke-stranke/20240202-134344/politicke-stranke.xlsx
+        Choose newest resource based on (created_at/last_modified) when present.
+        Prefer xlsx > csv if timestamps are comparable.
         """
-        ds = KNOWN_DATASETS["political_parties"]
-        data = self._download_file(ds["file_url"], "politicke_stranke.xlsx")
+        def ts(res: Dict) -> str:
+            return (res.get("last_modified") or res.get("created_at") or "").strip()
 
-        if not data:
-            logger.warning("parties_download_failed_using_fallback")
-            return self._fallback_parties()
+        def fmt(res: Dict) -> str:
+            return (res.get("format") or res.get("mime") or "").lower()
 
-        try:
+        ranked: List[Tuple[str, int, Dict]] = []
+        for res in resources or []:
+            f = fmt(res)
+            priority = 0
+            if "xlsx" in f:
+                priority = 2
+            elif "csv" in f:
+                priority = 1
+            ranked.append((ts(res), priority, res))
+
+        ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = ranked[0][2] if ranked else {}
+        best_fmt = fmt(best)
+        return best, ("xlsx" if "xlsx" in best_fmt else "csv" if "csv" in best_fmt else best_fmt or "unknown")
+
+    def _download_cached(self, url: str, cache_name: str, force_refresh: bool) -> bytes:
+        cache_path = os.path.join(DATA_DIR, "raw", "opendata", cache_name)
+        if not force_refresh and os.path.exists(cache_path) and os.path.getsize(cache_path) > 1000:
+            logger.info("opendata_cache_hit", file=cache_name)
+            return open(cache_path, "rb").read()
+
+        logger.info("opendata_download", url=url, file=cache_name)
+        r = self.client.get(url)
+        r.raise_for_status()
+        data = r.content
+        with open(cache_path, "wb") as f:
+            f.write(data)
+        time.sleep(SCRAPE_DELAY)
+        return data
+
+    def fetch_political_parties(self, force_refresh: bool = False) -> List[PoliticalPartyRecord]:
+        ds = self._get_dataset(PARTIES_DATASET_SLUG)
+        resources = ds.get("resources") or []
+        if not resources:
+            logger.warning("parties_no_resources", slug=PARTIES_DATASET_SLUG)
+            return []
+
+        res, fmt = self._pick_newest_resource(resources)
+
+        res_url = (res.get("url") or "").strip()
+        if not res_url:
+            logger.warning("parties_resource_missing_url", slug=PARTIES_DATASET_SLUG)
+            return []
+
+        # Store metadata for debugging
+        meta_path = os.path.join(DATA_DIR, "raw", "opendata", "parties_source.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "dataset_slug": PARTIES_DATASET_SLUG,
+                    "dataset_title": ds.get("title"),
+                    "picked_resource": {
+                        "title": res.get("title"),
+                        "format": res.get("format"),
+                        "url": res_url,
+                        "created_at": res.get("created_at"),
+                        "last_modified": res.get("last_modified"),
+                        "filesize": res.get("filesize"),
+                    },
+                    "scraped_at": datetime.utcnow().isoformat(),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        payload = self._download_cached(res_url, f"political_parties.{fmt}", force_refresh=force_refresh)
+
+        records: List[PoliticalPartyRecord] = []
+        if fmt == "xlsx":
             import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
+            wb = openpyxl.load_workbook(io.BytesIO(payload), read_only=True)
             ws = wb.active
-            headers = [str(c.value) if c.value else "" for c in next(ws.iter_rows(max_row=1))]
-            logger.info("parties_xlsx_headers", headers=headers)
-
-            parties = []
-            for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
-                rowdict = dict(zip(headers, row))
-                name = str(rowdict.get("Странка") or rowdict.get("Stranka") or "").strip()
+            headers = [str(c.value).strip() if c.value is not None else "" for c in next(ws.iter_rows(max_row=1))]
+            for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
+                rowd = dict(zip(headers, row))
+                name = str(rowd.get("Странка") or rowd.get("Stranka") or rowd.get("Назив") or rowd.get("Naziv") or "").strip()
                 if not name or name == "None":
                     continue
 
-                abbr = str(rowdict.get("Скраћени назив") or rowdict.get("Skraceni naziv") or "").strip()
+                abbr = str(rowd.get("Скраћени назив") or rowd.get("Skraceni naziv") or rowd.get("Скраћено") or "").strip()
                 abbr = abbr if abbr and abbr != "None" else None
 
-                party = PoliticalPartyRecord(
-                    party_id=f"PARTY-DGR-{i+1:04d}",
-                    name=name,
-                    name_normalized=_normalize(name),
-                    abbreviation=abbr,
-                    founded=str(rowdict.get("Датум оснивања") or rowdict.get("Datum osnivanja") or "").strip() or None,
-                    address=str(rowdict.get("Адреса") or rowdict.get("Adresa") or "").strip() or None,
-                    city=str(rowdict.get("Место") or rowdict.get("Mesto") or "").strip() or None,
-                    leader=str(rowdict.get("Заступник") or rowdict.get("Zastupnik") or "").strip() or None,
-                    dissolved=str(rowdict.get("Датум доношења решења о брисању") or "").strip() or None,
-                )
-                # Skip parties that have been dissolved (non-empty dissolution date)
-                if party.dissolved and party.dissolved != "None":
+                dissolved = str(rowd.get("Датум доношења решења о брисању") or rowd.get("Datum brisanja") or "").strip()
+                dissolved = dissolved if dissolved and dissolved != "None" else None
+                if dissolved:
                     continue
-                parties.append(party)
 
+                pid = f"PARTY-{_slugify(name)}"
+                records.append(
+                    PoliticalPartyRecord(
+                        party_id=pid,
+                        name=name,
+                        name_normalized=_normalize(name),
+                        abbreviation=abbr,
+                        founded=str(rowd.get("Датум оснивања") or rowd.get("Datum osnivanja") or "").strip() or None,
+                        address=str(rowd.get("Адреса") or rowd.get("Adresa") or "").strip() or None,
+                        city=str(rowd.get("Место") or rowd.get("Mesto") or "").strip() or None,
+                        leader=str(rowd.get("Заступник") or rowd.get("Zastupnik") or "").strip() or None,
+                        dissolved=None,
+                    )
+                )
             wb.close()
-            logger.info("parties_parsed", count=len(parties))
 
-            # Save
-            path = f"{DATA_DIR}/raw/opendata/parties.json"
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump([asdict(p) for p in parties], f, ensure_ascii=False, indent=2)
-
-            return parties
-
-        except ImportError:
-            logger.error("openpyxl_not_installed")
-            return self._fallback_parties()
-        except Exception as e:
-            logger.error("parties_parse_error", error=str(e))
-            return self._fallback_parties()
-
-    def _fallback_parties(self) -> list[PoliticalPartyRecord]:
-        """Major active Serbian political parties as fallback."""
-        parties_data = [
-            ("Srpska napredna stranka", "SNS", "2008", "Beograd", "Aleksandar Vučić"),
-            ("Socijalistička partija Srbije", "SPS", "1990", "Beograd", "Ivica Dačić"),
-            ("Stranka slobode i pravde", "SSP", "2019", "Beograd", "Dragan Đilas"),
-            ("Demokratska stranka", "DS", "1990", "Beograd", "Zoran Lutovac"),
-            ("Narodna stranka", "NS", "2014", "Beograd", "Vuk Jeremić"),
-            ("Pokret obnove Kraljevine Srbije", "POKS", "1994", "Beograd", "Bogoljub Karić"),
-            ("Zeleno-levi front", "ZLF", "2021", "Beograd", "Nebojša Zelić"),
-            ("Srbija centar", "SCA", "2022", "Beograd", "Zdravko Ponoš"),
-        ]
-        result = []
-        for i, (name, abbr, founded, city, leader) in enumerate(parties_data):
-            result.append(PoliticalPartyRecord(
-                party_id=f"PARTY-DGR-{i+1:04d}",
-                name=name,
-                name_normalized=_normalize(name),
-                abbreviation=abbr,
-                founded=founded,
-                address=None,
-                city=city,
-                leader=leader,
-                dissolved=None,
-            ))
-        return result
-
-    def discover_datasets(self, tag: str = "budzet", page_size: int = 20) -> list[dict]:
-        """
-        Browse data.gov.rs udata API by tag.
-        Returns list of dataset metadata dicts with resource URLs.
-        """
-        try:
-            resp = self.client.get(
-                f"{UDATA_API}/datasets/",
-                params={"tag": tag, "page_size": page_size, "sort": "-created"},
-            )
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
-            datasets = []
-            for ds in data.get("data", []):
-                for resource in ds.get("resources", []):
-                    fmt = resource.get("format", "").lower()
-                    if fmt in ("csv", "xlsx", "xls", "json"):
-                        datasets.append({
-                            "slug": ds.get("slug"),
-                            "title": ds.get("title"),
-                            "format": fmt,
-                            "url": resource.get("url"),
-                            "size": resource.get("filesize"),
-                        })
-            return datasets
-        except Exception as e:
-            logger.error("udata_discover_error", error=str(e))
+        elif fmt == "csv":
+            import csv
+            text = payload.decode("utf-8", errors="replace")
+            reader = csv.DictReader(text.splitlines())
+            for row in reader:
+                name = (row.get("Странка") or row.get("Stranka") or row.get("Назив") or row.get("Naziv") or "").strip()
+                if not name:
+                    continue
+                dissolved = (row.get("Датум доношења решења о брисању") or row.get("Datum brisanja") or "").strip() or None
+                if dissolved:
+                    continue
+                pid = f"PARTY-{_slugify(name)}"
+                abbr = (row.get("Скраћени назив") or row.get("Skraceni naziv") or "").strip() or None
+                records.append(
+                    PoliticalPartyRecord(
+                        party_id=pid,
+                        name=name,
+                        name_normalized=_normalize(name),
+                        abbreviation=abbr,
+                        founded=(row.get("Датум оснивања") or row.get("Datum osnivanja") or "").strip() or None,
+                        address=(row.get("Адреса") or row.get("Adresa") or "").strip() or None,
+                        city=(row.get("Место") or row.get("Mesto") or "").strip() or None,
+                        leader=(row.get("Заступник") or row.get("Zastupnik") or "").strip() or None,
+                        dissolved=None,
+                    )
+                )
+        else:
+            logger.warning("parties_unknown_format", fmt=fmt)
             return []
 
-    def close(self):
-        self.client.close()
+        out_path = os.path.join(DATA_DIR, "raw", "opendata", "parties.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump([asdict(r) for r in records], f, ensure_ascii=False, indent=2)
+
+        logger.info("opendata_parties_done", count=len(records), fmt=fmt)
+        return records

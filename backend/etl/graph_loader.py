@@ -119,12 +119,13 @@ class GraphLoader:
         })
 
     def _load_ujn_procurement(self, record: dict):
-        """MERGE a procurement notice and link to its institution."""
+        """MERGE a procurement notice and link to its institution and supplier (if available)."""
         cid = record.get("contract_id")
         title = record.get("title") or record.get("subject", "")
         inst_mb = record.get("institution_mb", "")
         if not cid or not title:
             return
+
         run_query("""
             MERGE (c:Contract {contract_id: $cid})
             SET c.title            = $title,
@@ -133,20 +134,25 @@ class GraphLoader:
                 c.subject_type     = $subject_type,
                 c.award_date       = $date,
                 c.has_award        = $has_award,
+                c.contract_value   = $value,
+                c.currency         = $currency,
                 c.source           = 'ujn',
                 c.verification_url = $vurl,
                 c.updated_at       = $now
         """, {
             "cid": cid,
-            "title": title[:250],
-            "subject": record.get("subject", "")[:250],
+            "title": str(title)[:250],
+            "subject": str(record.get("subject", ""))[:250],
             "proc_type": record.get("proc_type", ""),
             "subject_type": record.get("subject_type", ""),
             "date": record.get("date_modified", ""),
-            "has_award": record.get("has_award_decision", False),
+            "has_award": bool(record.get("has_award_decision", False)),
+            "value": record.get("contract_value"),
+            "currency": record.get("currency", "RSD"),
             "vurl": record.get("detail_url", ""),
             "now": datetime.utcnow().isoformat(),
         })
+
         # Link to institution
         if inst_mb:
             run_query("""
@@ -155,7 +161,30 @@ class GraphLoader:
                 MERGE (i)-[:AWARDED_CONTRACT]->(c)
             """, {"mb": inst_mb, "cid": cid})
 
+        # Supplier / Company (if present in OpenData)
+        supplier_mb = (record.get("supplier_mb") or "").strip()
+        supplier_name = (record.get("supplier_name") or "").strip()
+
+        if supplier_mb or supplier_name:
+            # If we have no MB, create a stable pseudo id by hashing name
+            mb = supplier_mb if supplier_mb else f"NO_MB_{abs(hash(supplier_name)) % 10**10}"
+
+            run_query("""
+                MERGE (co:Company {maticni_broj: $mb})
+                SET co.name = coalesce(co.name, $name),
+                    co.source = coalesce(co.source, 'ujn_opend'),
+                    co.updated_at = $now
+            """, {"mb": mb, "name": supplier_name or mb, "now": datetime.utcnow().isoformat()})
+
+            run_query("""
+                MATCH (co:Company {maticni_broj: $mb})
+                MATCH (c:Contract {contract_id: $cid})
+                MERGE (co)-[r:WON_CONTRACT]->(c)
+                SET r.source = 'ujn_opend'
+            """, {"mb": mb, "cid": cid})
+
     def _load_party(self, record: dict):
+(self, record: dict):
         """MERGE a real political party from data.gov.rs."""
         party_id = record.get("party_id")
         name = record.get("name", "")

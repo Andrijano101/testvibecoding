@@ -989,3 +989,60 @@ def _build_html_report(findings: list, risk: dict) -> str:
 def health():
     """Health check."""
     return check_health()
+
+
+@app.get("/stats")
+def stats():
+    """
+    Quick sanity endpoint:
+    - counts by key labels
+    - how many contracts have WON_CONTRACT edges (needed for detectors)
+    """
+    labels = ["Person", "Company", "Institution", "Contract", "PoliticalParty", "BudgetItem"]
+    out = {"labels": {}, "relationships": {}, "ts": datetime.utcnow().isoformat()}
+
+    for lab in labels:
+        q = f"MATCH (n:{lab}) RETURN count(n) AS c"
+        res = run_query(q, {}).single()
+        out["labels"][lab] = int(res["c"]) if res else 0
+
+    res = run_query("MATCH (:Company)-[r:WON_CONTRACT]->(:Contract) RETURN count(r) AS c", {}).single()
+    out["relationships"]["WON_CONTRACT"] = int(res["c"]) if res else 0
+
+    res = run_query("MATCH (:Institution)-[r:AWARDED_CONTRACT]->(:Contract) RETURN count(r) AS c", {}).single()
+    out["relationships"]["AWARDED_CONTRACT"] = int(res["c"]) if res else 0
+
+    return out
+
+
+@app.get("/contracts/suspicious")
+def suspicious_contracts(limit: int = 200):
+    """
+    Returns only contracts that appear in any detector findings.
+    If detectors return empty (because data lacks companies), this returns empty too.
+    """
+    findings = run_all_detectors(limit=10000)
+
+    contract_ids = set()
+    for f in findings:
+        cid = f.get("contract_id")
+        if cid:
+            contract_ids.add(cid)
+
+    if not contract_ids:
+        return {"contracts": [], "count": 0, "note": "No suspicious contracts found (or missing company data for detection)."}
+
+    # Fetch contract nodes
+    q = """
+    MATCH (c:Contract)
+    WHERE c.contract_id IN $ids
+    RETURN c
+    LIMIT $limit
+    """
+    rows = run_query(q, {"ids": list(contract_ids), "limit": limit})
+    contracts = []
+    for r in rows:
+        node = r["c"]
+        contracts.append(dict(node))
+
+    return {"contracts": contracts, "count": len(contracts)}
