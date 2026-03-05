@@ -338,6 +338,77 @@ def network_reach(person_id: str, max_depth: int = 3):
     """, {"pid": person_id, "depth": max_depth, "limit": 200}
 
 
+def repeated_winner(min_contracts: int = 3, months: int = 12):
+    """A company wins N+ contracts from the same institution within M months.
+
+    High single-institution dependency is a red flag for cronyism.
+    """
+    return """
+    MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct:Contract)<-[:WON_CONTRACT]-(co:Company)
+    WHERE ct.award_date IS NOT NULL
+    WITH inst, co, collect(ct) AS contracts, count(ct) AS num,
+         sum(coalesce(ct.contract_value, ct.value_rsd, 0)) AS total_value
+    WHERE num >= $min_contracts
+    WITH inst, co, contracts, num, total_value,
+         CASE
+           WHEN total_value >= 50000000 THEN 'critical'
+           WHEN total_value >= 20000000 THEN 'high'
+           WHEN num >= 5               THEN 'high'
+           ELSE 'medium'
+         END AS severity
+    RETURN
+        inst.name AS institution,
+        inst.institution_id AS institution_id,
+        co.name AS company_name,
+        co.maticni_broj AS company_mb,
+        num AS num_contracts,
+        total_value,
+        [c IN contracts | {title: c.title, value: coalesce(c.contract_value, c.value_rsd), date: c.award_date, id: c.contract_id}] AS contracts_detail,
+        severity,
+        'repeated_winner' AS pattern_type
+    ORDER BY total_value DESC
+    LIMIT 50
+    """, {"min_contracts": min_contracts}
+
+
+def new_company_big_contract(max_age_years: int = 3, min_value_rsd: int = 5_000_000):
+    """A recently founded company wins a large contract quickly.
+
+    Young companies with no track record winning large public contracts are suspicious.
+    """
+    return """
+    MATCH (co:Company)-[:WON_CONTRACT]->(ct:Contract)
+    WHERE co.founding_date IS NOT NULL AND co.founding_date <> ''
+      AND coalesce(ct.contract_value, ct.value_rsd, 0) >= $min_value
+    WITH co, ct,
+         toInteger(substring(ct.award_date, 0, 4)) - toInteger(substring(co.founding_date, 0, 4)) AS age_at_award
+    WHERE age_at_award IS NOT NULL AND age_at_award <= $max_age
+    OPTIONAL MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct)
+    WITH co, ct, inst, age_at_award,
+         CASE
+           WHEN age_at_award = 0 THEN 'critical'
+           WHEN age_at_award <= 1 AND coalesce(ct.contract_value, ct.value_rsd, 0) >= 10000000 THEN 'critical'
+           WHEN age_at_award <= 2 THEN 'high'
+           ELSE 'medium'
+         END AS severity
+    RETURN
+        co.name AS company_name,
+        co.maticni_broj AS company_mb,
+        co.founding_date AS founded,
+        age_at_award,
+        ct.title AS contract_title,
+        ct.contract_id AS contract_id,
+        coalesce(ct.contract_value, ct.value_rsd) AS contract_value,
+        ct.award_date AS award_date,
+        inst.name AS institution,
+        inst.institution_id AS institution_id,
+        severity,
+        'new_company_big_contract' AS pattern_type
+    ORDER BY age_at_award ASC, contract_value DESC
+    LIMIT 50
+    """, {"min_value": min_value_rsd, "max_age": max_age_years}
+
+
 # ── Aggregate risk scoring ──────────────────────────────────
 
 SEVERITY_WEIGHTS = {"critical": 10, "high": 5, "medium": 2, "low": 1}
@@ -348,6 +419,8 @@ ALL_DETECTORS = [
     ("shells", shell_company_clusters),
     ("revolving_door", revolving_door),
     ("budget_allocation", budget_self_allocation),
+    ("repeated_winner", lambda: repeated_winner()),
+    ("new_company_big_contract", lambda: new_company_big_contract()),
 ]
 
 

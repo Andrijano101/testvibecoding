@@ -37,9 +37,10 @@ SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "2"))
 SCRAPER_TIMEOUT = float(os.getenv("SCRAPER_TIMEOUT", "180"))
 USER_AGENT = os.getenv("SCRAPER_UA", "SrpskaTransparentnost/1.0 (+local)")
 
-BASE = os.getenv("UJN_OPEND_BASE", "http://portal.ujn.gov.rs/OpenD").rstrip("/")
-PROCUREMENT_YEARS = os.getenv("PROCUREMENT_YEARS", "last:2")
-PROCUREMENT_MAX_ROWS = int(os.getenv("PROCUREMENT_MAX_ROWS", "3000"))
+BASE = os.getenv("UJN_OPEND_BASE", "https://portal.ujn.gov.rs/OpenD").rstrip("/")
+BASE_FALLBACK = os.getenv("UJN_OPEND_BASE_FALLBACK", "http://portal.ujn.gov.rs/OpenD").rstrip("/")
+PROCUREMENT_YEARS = os.getenv("PROCUREMENT_YEARS", "last:3")
+PROCUREMENT_MAX_ROWS = int(os.getenv("PROCUREMENT_MAX_ROWS", "1000"))
 
 
 def _ensure_dirs():
@@ -77,9 +78,12 @@ def _resolve_years(spec: str) -> List[str]:
 
 
 def _candidate_urls(year: str) -> List[Tuple[str, str]]:
+    """Return candidate download URLs in priority order (https first, then http fallback)."""
     return [
         (f"{BASE}/OpenData_{year}.xlsx", "xlsx"),
         (f"{BASE}/OpenData_{year}.csv", "csv"),
+        (f"{BASE_FALLBACK}/OpenData_{year}.xlsx", "xlsx"),
+        (f"{BASE_FALLBACK}/OpenData_{year}.csv", "csv"),
     ]
 
 
@@ -159,20 +163,71 @@ class ProcurementBulkScraper:
         else:
             raise ValueError(f"Unsupported format: {fmt}")
 
-        # Heuristic column mapping
-        # Contract id fields
+        # Heuristic column mapping — covers all known UJN OpenData column name variants
         contract_id_idx = self._find_header(headers_norm, [
             "broj obavestenja", "broj obaveštenja",
             "id", "sifra", "šifra", "oznaka",
             "broj postupka", "broj nabavke", "ref. br",
+            "redni broj", "rb",
         ])
-        title_idx = self._find_header(headers_norm, ["predmet", "naziv", "opis", "subject", "title"])
-        inst_name_idx = self._find_header(headers_norm, ["narucilac naziv", "naručilac naziv", "narucilac", "naručilac"])
-        inst_mb_idx = self._find_header(headers_norm, ["narucilac maticni", "naručilac matični", "maticni broj narucioca", "matični broj naručioca", "mb narucioca"])
-        supplier_name_idx = self._find_header(headers_norm, ["ugovorna strana", "ponudjac", "ponuđač", "dobavljac", "dobavljač", "izabrani ponudjac", "izabrani ponuđač"])
-        supplier_mb_idx = self._find_header(headers_norm, ["maticni broj ponudjaca", "matični broj ponuđača", "mb ponudjaca", "mb ponuđača", "maticni broj dobavljaca", "matični broj dobavljača"])
-        value_idx = self._find_header(headers_norm, ["ukupni iznos", "ukupna vrednost", "ugovoreni iznos", "vrednost", "iznos"])
-        date_idx = self._find_header(headers_norm, ["datum", "date", "objavljeno", "zakljucenja", "zaključenja"])
+        title_idx = self._find_header(headers_norm, [
+            "predmet nabavke", "predmet", "naziv nabavke", "naziv",
+            "opis predmeta", "opis", "subject", "title",
+        ])
+        inst_name_idx = self._find_header(headers_norm, [
+            "naziv narucilaca", "naziv naručioca",
+            "narucilac naziv", "naručilac naziv",
+            "narucilac", "naručilac",
+            "naziv narucilac",
+        ])
+        inst_mb_idx = self._find_header(headers_norm, [
+            "maticni broj narucilaca", "matični broj naručioca",
+            "narucilac maticni", "naručilac matični",
+            "maticni broj narucioca", "matični broj naručioca",
+            "mb narucioca", "mb narucilaca",
+        ])
+        # Real UJN files use "ugovarac" (contractor) for award records
+        supplier_name_idx = self._find_header(headers_norm, [
+            "naziv ugovaraca", "naziv ugovarača",
+            "ugovarac", "ugovarač",
+            "ugovorna strana",
+            "ponudjac naziv", "ponuđač naziv",
+            "izabrani ponudjac", "izabrani ponuđač",
+            "ponudjac", "ponuđač",
+            "dobavljac naziv", "dobavljač naziv",
+            "dobavljac", "dobavljač",
+        ])
+        supplier_mb_idx = self._find_header(headers_norm, [
+            "maticni broj ugovaraca", "matični broj ugovarača",
+            "mb ugovaraca", "mb ugovarača",
+            "maticni broj ponudjaca", "matični broj ponuđača",
+            "mb ponudjaca", "mb ponuđača",
+            "maticni broj dobavljaca", "matični broj dobavljača",
+        ])
+        value_idx = self._find_header(headers_norm, [
+            "ukupna vrednost ugovora", "ukupni iznos ugovora",
+            "ukupni iznos", "ukupna vrednost",
+            "ugovoreni iznos", "vrednost ugovora",
+            "vrednost", "iznos",
+        ])
+        date_idx = self._find_header(headers_norm, [
+            "datum zakljucenja ugovora", "datum zaključenja ugovora",
+            "datum zakljucivanja", "datum zaključivanja",
+            "datum", "date", "objavljeno",
+            "datum obavestenja", "datum obaveštenja",
+        ])
+
+        logger.info("ujn_columns_detected",
+            contract_id=contract_id_idx,
+            title=title_idx,
+            inst_name=inst_name_idx,
+            supplier_name=supplier_name_idx,
+            supplier_mb=supplier_mb_idx,
+            value=value_idx,
+            date=date_idx,
+            total_cols=len(headers),
+            sample_cols=headers[:10],
+        )
 
         # Build procurement records
         procurements: List[Dict[str, Any]] = []

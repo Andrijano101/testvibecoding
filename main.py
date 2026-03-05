@@ -334,6 +334,20 @@ def detect_donor_contracts():
     return {"patterns": run_query(detection.political_donor_contracts())}
 
 
+@app.get("/detect/repeated-winner")
+def detect_repeated_winner(min_contracts: int = 3):
+    """Detect companies that repeatedly win from the same institution."""
+    query, params = detection.repeated_winner(min_contracts=min_contracts)
+    return {"patterns": run_query(query, params)}
+
+
+@app.get("/detect/new-company-big-contract")
+def detect_new_company_big_contract(max_age_years: int = 3, min_value: float = 5_000_000):
+    """Detect recently-founded companies winning large contracts."""
+    query, params = detection.new_company_big_contract(max_age_years=max_age_years, min_value_rsd=int(min_value))
+    return {"patterns": run_query(query, params)}
+
+
 @app.get("/detect/all")
 def detect_all():
     """Run all detection patterns and return summary with risk scoring."""
@@ -525,6 +539,160 @@ def get_graph_overview(limit: int = Query(150, ge=10, le=500)):
     return {"nodes": nodes, "edges": edges}
 
 
+@app.get("/graph/suspicious")
+def get_suspicious_graph(limit: int = Query(300, ge=10, le=1000)):
+    """
+    Return only the subgraph of entities that appear in at least one detection pattern.
+    Contracts without a flagged company, and companies not linked to any pattern, are excluded.
+    This is the 'real-data' view: only shady nodes shown.
+    """
+    # 1. Collect flagged entity IDs from all active detectors
+    flagged_company_mbs: set = set()
+    flagged_contract_ids: set = set()
+    flagged_institution_ids: set = set()
+    flagged_person_ids: set = set()
+
+    detectors = [
+        detection.conflict_of_interest,
+        detection.ghost_employees,
+        detection.shell_company_clusters,
+        detection.revolving_door,
+        detection.political_donor_contracts,
+        lambda: detection.single_bidder_contracts(1_000_000),
+        lambda: detection.contract_splitting(6_000_000),
+    ]
+
+    for func in detectors:
+        try:
+            result = func()
+            query, params = (result if isinstance(result, tuple) else (result, {}))
+            rows = run_query(query, params)
+            for row in rows:
+                for key, val in row.items():
+                    if val is None:
+                        continue
+                    if "company_mb" in key or "winner_mb" in key:
+                        flagged_company_mbs.add(str(val))
+                    elif "contract_id" in key:
+                        flagged_contract_ids.add(str(val))
+                    elif "institution_id" in key:
+                        flagged_institution_ids.add(str(val))
+                    elif "official_id" in key or "person_id" in key or "family_id" in key:
+                        flagged_person_ids.add(str(val))
+        except Exception as e:
+            logger.warning("suspicious_graph_detector_failed", error=str(e))
+
+    if not any([flagged_company_mbs, flagged_contract_ids, flagged_institution_ids, flagged_person_ids]):
+        return {"nodes": [], "edges": [], "flagged_counts": {
+            "companies": 0, "contracts": 0, "institutions": 0, "persons": 0,
+        }}
+
+    # 2. Fetch nodes for each flagged set
+    def _node_shape(n_alias: str) -> str:
+        return f"""
+            CASE WHEN {n_alias}:Person      THEN {n_alias}.person_id
+                 WHEN {n_alias}:Company     THEN {n_alias}.maticni_broj
+                 WHEN {n_alias}:Institution THEN {n_alias}.institution_id
+                 WHEN {n_alias}:Contract    THEN {n_alias}.contract_id
+                 WHEN {n_alias}:BudgetItem  THEN {n_alias}.budget_id
+                 WHEN {n_alias}:PoliticalParty THEN {n_alias}.party_id
+                 ELSE toString(id({n_alias}))
+            END AS id,
+            CASE WHEN {n_alias}:Person      THEN {n_alias}.full_name
+                 WHEN {n_alias}:Company     THEN {n_alias}.name
+                 WHEN {n_alias}:Institution THEN {n_alias}.name
+                 WHEN {n_alias}:Contract    THEN {n_alias}.title
+                 WHEN {n_alias}:BudgetItem  THEN {n_alias}.program_name
+                 WHEN {n_alias}:PoliticalParty THEN {n_alias}.name
+                 ELSE ''
+            END AS name,
+            labels({n_alias})[0] AS type,
+            properties({n_alias}) AS props
+        """
+
+    nodes_raw: list = []
+    params_n: dict = {}
+
+    if flagged_company_mbs:
+        params_n["co_mbs"] = list(flagged_company_mbs)
+        nodes_raw += run_query(
+            f"MATCH (n:Company) WHERE n.maticni_broj IN $co_mbs RETURN {_node_shape('n')} LIMIT $lim",
+            {**params_n, "lim": limit},
+        )
+    if flagged_contract_ids:
+        nodes_raw += run_query(
+            f"MATCH (n:Contract) WHERE n.contract_id IN $ct_ids RETURN {_node_shape('n')} LIMIT $lim",
+            {"ct_ids": list(flagged_contract_ids), "lim": limit},
+        )
+    if flagged_institution_ids:
+        nodes_raw += run_query(
+            f"MATCH (n:Institution) WHERE n.institution_id IN $inst_ids RETURN {_node_shape('n')} LIMIT $lim",
+            {"inst_ids": list(flagged_institution_ids), "lim": limit},
+        )
+    if flagged_person_ids:
+        nodes_raw += run_query(
+            f"MATCH (n:Person) WHERE n.person_id IN $p_ids RETURN {_node_shape('n')} LIMIT $lim",
+            {"p_ids": list(flagged_person_ids), "lim": limit},
+        )
+
+    # Deduplicate by id
+    seen: set = set()
+    nodes: list = []
+    for n in nodes_raw:
+        if n.get("id") and n["id"] not in seen:
+            seen.add(n["id"])
+            nodes.append(n)
+
+    # 3. Fetch edges between flagged nodes
+    all_ids = list(seen)
+    edges: list = []
+    if len(all_ids) >= 2:
+        edge_node = _node_shape("a").replace("AS id,", "AS source,").replace(
+            "AS name,", "AS _a_name,").replace("AS type,", "AS _a_type,").replace("AS props", "AS _a_props")
+        edges = run_query("""
+            MATCH (a)-[r]->(b)
+            WHERE (
+                  CASE WHEN a:Company     THEN a.maticni_broj
+                       WHEN a:Contract    THEN a.contract_id
+                       WHEN a:Institution THEN a.institution_id
+                       WHEN a:Person      THEN a.person_id
+                       ELSE toString(id(a)) END
+            ) IN $all_ids
+            AND (
+                  CASE WHEN b:Company     THEN b.maticni_broj
+                       WHEN b:Contract    THEN b.contract_id
+                       WHEN b:Institution THEN b.institution_id
+                       WHEN b:Person      THEN b.person_id
+                       ELSE toString(id(b)) END
+            ) IN $all_ids
+            RETURN
+                CASE WHEN a:Company     THEN a.maticni_broj
+                     WHEN a:Contract    THEN a.contract_id
+                     WHEN a:Institution THEN a.institution_id
+                     WHEN a:Person      THEN a.person_id
+                     ELSE toString(id(a)) END AS source,
+                CASE WHEN b:Company     THEN b.maticni_broj
+                     WHEN b:Contract    THEN b.contract_id
+                     WHEN b:Institution THEN b.institution_id
+                     WHEN b:Person      THEN b.person_id
+                     ELSE toString(id(b)) END AS target,
+                type(r) AS relationship,
+                properties(r) AS props
+            LIMIT $lim
+        """, {"all_ids": all_ids, "lim": limit * 3})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "flagged_counts": {
+            "companies": len(flagged_company_mbs),
+            "contracts": len(flagged_contract_ids),
+            "institutions": len(flagged_institution_ids),
+            "persons": len(flagged_person_ids),
+        },
+    }
+
+
 @app.get("/entities")
 def list_entities(
     type: str = Query(..., description="Person | Company | Institution | Contract | PoliticalParty"),
@@ -574,49 +742,48 @@ def list_entities(
 
 # ── Scraping & loading ──────────────────────────────────────────
 
-def _run_scrape(source: str):
-    """Run a scraper in a background thread."""
+def _run_scrape(source: str, since_days: int = 7, years: str = None, force_refresh: bool = False):
+    """Run a scraper. Called from background thread or directly."""
     logger.info("scrape_start", source=source)
     try:
         if source in ("rik", "all"):
             from backend.scrapers.rik_scraper import RIKScraper
             s = RIKScraper()
             s.scrape_mps()
-            s.close()
+            s.client.close()
             logger.info("scrape_done", source="rik")
 
         if source in ("opendata", "all"):
             from backend.scrapers.opendata_scraper import OpenDataScraper
             s = OpenDataScraper()
-            s.fetch_political_parties()
-            s.close()
+            s.fetch_political_parties(force_refresh=force_refresh)
+            s.client.close()
             logger.info("scrape_done", source="opendata")
 
         if source in ("ujn", "all"):
             from backend.scrapers.procurement_bulk_scraper import ProcurementBulkScraper
             s = ProcurementBulkScraper()
-            s.scrape(year="2020", max_rows=5000)
-            s.close()
+            # years=None → uses PROCUREMENT_YEARS env var (default "last:2")
+            # max_rows capped: we only want award-decision rows, quality > quantity
+            s.scrape(years=years, max_rows=int(os.getenv("PROCUREMENT_MAX_ROWS", "1000")), force_refresh=force_refresh)
+            s.client.close()
             logger.info("scrape_done", source="ujn")
 
         if source in ("gazette", "all"):
             from backend.scrapers.sluzbeni_glasnik_scraper import SluzbeniGlasnikScraper
             s = SluzbeniGlasnikScraper()
-            s.scrape_recent(days=30)
-            s.close()
+            s.scrape_recent(days=since_days)
+            s.client.close()
             logger.info("scrape_done", source="gazette")
 
         if source in ("rgz", "all"):
             # RGZ requires owner name queries — skip live scrape, seed data only
-            from backend.scrapers.rgz_scraper import RGZScraper
-            s = RGZScraper()
-            s.close()
             logger.info("scrape_done", source="rgz")
 
         if source in ("procurement", "all"):
             from backend.scrapers.procurement_scraper import ProcurementScraper
             s = ProcurementScraper()
-            s.scrape_recent(days=7)
+            s.scrape_recent(days=since_days)
             s.close()
             logger.info("scrape_done", source="procurement")
 
@@ -652,7 +819,12 @@ def _run_load(source: str):
 
 
 @app.post("/scrape/{source}")
-def trigger_scrape(source: str):
+def trigger_scrape(
+    source: str,
+    since_days: int = Query(7, description="Days back for time-based scrapers"),
+    years: Optional[str] = Query(None, description="Comma list or 'last:N', e.g. last:3 or 2025,2024"),
+    force_refresh: bool = Query(False, description="Ignore cache and re-download"),
+):
     """
     Trigger a scrape for the given source.
     source: rik | opendata | gazette | rgz | procurement | all
@@ -661,7 +833,11 @@ def trigger_scrape(source: str):
     valid = {"rik", "opendata", "gazette", "rgz", "procurement", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
-    t = threading.Thread(target=_run_scrape, args=(source,), daemon=True)
+    t = threading.Thread(
+        target=_run_scrape,
+        kwargs={"source": source, "since_days": since_days, "years": years, "force_refresh": force_refresh},
+        daemon=True,
+    )
     t.start()
     return {"status": "started", "source": source}
 
@@ -707,27 +883,37 @@ def clear_seed():
 
 
 @app.post("/ingest/{source}")
-def ingest_source(source: str):
+def ingest_source(
+    source: str,
+    since_days: int = Query(7, description="Days back for time-based scrapers"),
+    years: Optional[str] = Query(None, description="Comma list or 'last:N', e.g. last:3"),
+    force_refresh: bool = Query(False, description="Ignore cache and re-download"),
+):
     """
     Scrape + load in one shot for a specific source or all sources.
-    source: rik | opendata | gazette | rgz | procurement | all
+    source: rik | opendata | gazette | rgz | procurement | ujn | all
 
     For 'all': scrapes all sources then loads everything into Neo4j.
-    This is the recommended way to exit demo mode.
+    This is the recommended way to populate with real data.
     """
-    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "all"}
+    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
 
     def _ingest():
-        _run_scrape(source)
+        _run_scrape(source, since_days=since_days, years=years, force_refresh=force_refresh)
         load_src = source if source != "all" else "all"
         _run_load(load_src)
         logger.info("ingest_complete", source=source)
 
     t = threading.Thread(target=_ingest, daemon=True)
     t.start()
-    return {"status": "started", "source": source, "message": "Scrape + load running in background. Watch /health or docker logs."}
+    return {
+        "status": "started",
+        "source": source,
+        "params": {"since_days": since_days, "years": years, "force_refresh": force_refresh},
+        "message": "Scrape + load running in background. Watch /health or docker logs.",
+    }
 
 
 # ── Export ──────────────────────────────────────────────────────

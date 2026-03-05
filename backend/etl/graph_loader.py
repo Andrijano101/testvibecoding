@@ -184,7 +184,6 @@ class GraphLoader:
             """, {"mb": mb, "cid": cid})
 
     def _load_party(self, record: dict):
-(self, record: dict):
         """MERGE a real political party from data.gov.rs."""
         party_id = record.get("party_id")
         name = record.get("name", "")
