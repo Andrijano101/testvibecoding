@@ -560,6 +560,8 @@ def get_suspicious_graph(limit: int = Query(300, ge=10, le=1000)):
         detection.political_donor_contracts,
         lambda: detection.single_bidder_contracts(1_000_000),
         lambda: detection.contract_splitting(6_000_000),
+        lambda: detection.repeated_winner(min_contracts=2),
+        lambda: detection.new_company_big_contract(max_age_years=3, min_value_rsd=5_000_000),
     ]
 
     for func in detectors:
