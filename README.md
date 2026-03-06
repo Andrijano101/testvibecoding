@@ -1,175 +1,287 @@
-# Procurement Graph Analyzer (Local Run)
+# Srpska Transparentnost — Graph Intelligence
 
-This repository contains a Docker-based application with:
-- **Frontend dashboard** (web UI)
-- **Backend API** (FastAPI)
-- **Neo4j** graph database
+Detects corruption patterns in Serbian public procurement using a knowledge graph.
+Connects MPs, government ministers, company directors, procurement contracts, and institutions — then runs automated pattern detection across the graph.
 
-## What you will open after it starts
-- Dashboard: http://localhost:3000
-- API docs: http://localhost:8000/docs
-- Health check: http://localhost:8000/health
+**Live data sources:** JN Portal (public contracts), APR (company registry), Otvoreni Parlament (MPs), Vlada RS (cabinet ministers)
 
 ---
 
-## Requirements (Windows)
-- Windows 10/11
-- Docker Desktop installed
-- WSL2 with Ubuntu 24.04 installed
-- Recommended: 8 GB RAM (minimum around 4 GB)
+## What you get
+
+- **Dashboard** at http://localhost:3000 — graph visualization, alert list, entity browser
+- **API docs** at http://localhost:8000/docs
+- **Neo4j browser** at http://localhost:7474 (user: `neo4j`, password from `.env`)
+
+### Detection patterns
+
+| Pattern | Description |
+|---|---|
+| Sukob interesa | Official's family member owns/directs a company that won contracts from the official's institution |
+| Poslanik/Funkcioner — direktor firme | MP or minister simultaneously directors a company winning public contracts |
+| Stalni pobednik | Same company wins 50%+ of an institution's total procurement budget |
+| Nova firma — veliki ugovor | Company under 3 years old wins high-value contracts |
+| Fantomski direktor | One person formally directs multiple companies all winning contracts from the same institution |
+| Deljenje ugovora | Same company wins multiple contracts from same institution just below legal threshold |
+| Jedan ponuđač | Contract received only one bid |
+| Institucionalni monopol | One company receives 70%+ of an institution's entire procurement budget |
+| Rotirajuca vrata | Former official moves to a company that then wins contracts from their former institution |
 
 ---
 
-## One-time setup
+## Requirements
 
-### 1) Install Ubuntu 24.04 (WSL)
-1. Open **Microsoft Store**
-2. Install **Ubuntu 24.04**
-3. Open Ubuntu and create a username + password
+| Requirement | Notes |
+|---|---|
+| Docker Desktop | With WSL2 backend enabled |
+| WSL2 + Ubuntu 24.04 | For Windows users |
+| 8 GB RAM | Neo4j uses 4 GB heap + 2 GB page cache by default |
+| Internet access | Scrapers pull live data from public portals |
 
-### 2) Install Docker Desktop
-1. Install Docker Desktop from Docker website
-2. Open Docker Desktop
+---
 
-### 3) Enable Docker + WSL integration
-In **Docker Desktop**:
-1. **Settings → General**: enable **Use the WSL 2 based engine**
-2. **Settings → Resources → WSL Integration**: enable **Ubuntu 24.04**
-3. Click **Apply & Restart**
+## Installation
 
-### 4) Verify Docker works inside Ubuntu
-Open **Ubuntu** and run:
+### 1. Clone the repository
+
 ```bash
-docker --version
-docker compose version
+git clone https://github.com/Andrijano101/testvibecoding.git
+cd testvibecoding
 ```
-If you see version numbers, Docker is ready.
 
----
+### 2. Create environment file
 
-## Project setup (every new machine)
-
-### 1) Put the project folder on your Desktop
-Unzip the project somewhere simple, for example:
-`C:\Users\<YOUR_USER>\Desktop\procurement-graph-analyzer`
-
-Important:
-- The folder must contain `docker-compose.yml` at the top level.
-
-### 2) Create your .env file
-In the project root, copy the example file:
 ```bash
 cp .env.example .env
 ```
 
-You can keep defaults for local use, or edit `.env` if needed.
+Default values work for local use. Edit `.env` if you want to change Neo4j password or scraping limits.
 
----
+### 3. Start all containers
 
-## Start the application
-
-### 1) Open Ubuntu and go to the project folder
-Example (adjust your Windows username and folder name):
-```bash
-cd "/mnt/c/Users/<YOUR_USER>/Desktop/procurement-graph-analyzer"
-```
-
-Confirm you are in the right place:
-```bash
-ls
-```
-You should see `docker-compose.yml`.
-
-### 2) Build and start containers
 ```bash
 docker compose up --build -d
 ```
 
-### 3) Wait for startup
-Wait about **60 seconds** on first start (Neo4j needs time).
+First build takes 2-4 minutes (downloads base images, installs Python + Node dependencies).
 
-### 4) Check health
+### 4. Wait for Neo4j to be ready (~60 seconds)
+
+```bash
+docker compose logs -f neo4j 2>&1 | grep -m1 "Started"
+```
+
+Or just check health:
+
 ```bash
 curl http://localhost:8000/health
+# Expected: {"status":"healthy","neo4j":"connected"}
+```
+
+### 5. Open the dashboard
+
+http://localhost:3000
+
+You will see a demo graph with synthetic test data. To load real data, continue below.
+
+---
+
+## Loading real data
+
+Data is loaded in stages. Each stage runs scraping + graph ingestion in the background.
+Watch progress with: `docker compose logs -f backend --tail=50`
+
+### Stage 1 — Public procurement contracts (JN Portal + UJN OpenData)
+
+```bash
+curl -X POST http://localhost:8000/ingest/jnportal
+```
+
+Fetches top contracts by value from jnportal.ujn.gov.rs (~5,000 contracts, ~5 min).
+
+```bash
+curl -X POST http://localhost:8000/ingest/procurement
+```
+
+Fetches historical procurement data from UJN OpenData (~5,000 records, ~2 min).
+
+### Stage 2 — Members of Parliament (Otvoreni Parlament)
+
+```bash
+curl -X POST http://localhost:8000/ingest/op
+```
+
+Scrapes all 250 MPs with party affiliation, committee roles, and declared company holdings (~3 min).
+
+### Stage 3 — Government ministers (Vlada RS)
+
+```bash
+curl -X POST http://localhost:8000/ingest/vlada
+```
+
+Fetches current cabinet from Wikipedia (~30 seconds, cached for 24h).
+
+### Stage 4 — Company directors (APR via CompanyWall)
+
+```bash
+curl -X POST http://localhost:8000/ingest/apr
+```
+
+Enriches top 500 companies by contract value with director names and property data from CompanyWall (~30-45 min due to rate limiting). This runs fully in background — you can use the dashboard while it runs.
+
+### Stage 5 — Run detection
+
+```bash
+curl -X POST http://localhost:8000/detect/all
+```
+
+Runs all 9 detection patterns across the graph. Results appear immediately in the dashboard alerts tab.
+
+---
+
+## Typical full ingest sequence
+
+```bash
+# Run stages 1-3 first (fast)
+curl -X POST http://localhost:8000/ingest/jnportal
+curl -X POST http://localhost:8000/ingest/procurement
+curl -X POST http://localhost:8000/ingest/op
+curl -X POST http://localhost:8000/ingest/vlada
+
+# Wait for each to finish, then start APR (slow, runs in background)
+curl -X POST http://localhost:8000/ingest/apr
+
+# Watch APR progress
+docker compose logs -f backend --tail=20
+
+# Once APR finishes (cw_scrape_done in logs), run detection
+curl -X POST http://localhost:8000/detect/all
 ```
 
 ---
 
-## Initialize database schema (first run)
-Run once after the first successful startup:
-```bash
-docker compose exec backend python -m backend.queries.init_schema
+## Using the dashboard
+
+### Graph tab
+- Click any node to see a quick summary in the sidebar
+- Click **Profil** to open the full entity detail panel (all contracts, directors, related entities)
+- Click **Graf** to expand the neighborhood graph for that entity
+- Use the search bar to find specific people, companies, or institutions
+
+### Upozorenja (Alerts) tab
+- Lists all detected patterns sorted by severity
+- Click any alert to see full explanation, detection logic, and source portals
+- Click **Profil firme** on an alert to open the company detail panel
+- Export as CSV, JSON, or printable HTML report
+
+### Podaci (Data) tab
+- Shows which data sources are active and how many records each contributed
+- Lists all detection patterns with hit counts
+
+### TEST toggle (header)
+- When off, hides all synthetic seed/demo data from graph, alerts, entity browser, stats, and exports
+- Use this to work with real data only
+
+---
+
+## Environment variables
+
+See `.env.example` for all options. Key settings:
+
+```env
+# Neo4j
+NEO4J_PASSWORD=changeme123
+
+# Scraping limits
+PROCUREMENT_YEARS=last:3        # How many years of UJN OpenData to fetch
+PROCUREMENT_MAX_ROWS=5000       # Max rows per year
+JNPORTAL_MAX_ROWS=5000          # Max live contracts from JN Portal
+CW_MAX_COMPANIES=500            # Companies to enrich with APR director data
+SCRAPE_DELAY=1.5                # Seconds between requests (be respectful)
 ```
 
 ---
 
-## Demo data vs real data (important)
+## Stopping and restarting
 
-You may see a message similar to:
-> All nodes in the graph are artificially created for demonstration. Real data is collected by running POST /ingest/all.
-
-That means the UI is showing **demo** data.
-
-### Ingest real data
-Run:
 ```bash
-curl -X POST http://localhost:8000/ingest/all
-```
-
-Watch progress:
-```bash
-docker compose logs -f backend --tail=200
-```
-
-If ingestion fails, the logs will usually show the reason (network/DNS/HTTP errors, rate limits, timeouts).
-
----
-
-## Stop the application
-```bash
+# Stop (data is preserved in Docker volumes)
 docker compose down
-```
 
-## Start it again later
-```bash
+# Start again (fast, no rebuild needed)
 docker compose up -d
+
+# Full reset — deletes all Neo4j data
+docker compose down -v
 ```
 
-## Reset everything (deletes database)
-Warning: this removes stored Neo4j data.
+---
+
+## Rebuilding after code changes
+
 ```bash
-docker compose down -v
+# Backend changes (Python) — restart is enough, code is volume-mounted
+docker compose restart backend
+
+# Frontend changes (React/JSX) — requires rebuild
+docker compose build frontend && docker compose up -d frontend
 ```
 
 ---
 
 ## Troubleshooting
 
-### Docker command not found in Ubuntu
-Fix Docker Desktop integration:
-- Docker Desktop → Settings → Resources → WSL Integration → enable Ubuntu 24.04
+**`docker: command not found` in Ubuntu**
+- Docker Desktop → Settings → Resources → WSL Integration → enable Ubuntu 24.04 → Apply & Restart
 
-### Ports already in use (3000 or 8000)
-Another app is using the port.
-- Stop the other app, or change port mappings in `docker-compose.yml`.
+**Port 3000 or 8000 already in use**
+- Change the host port in `docker-compose.yml` (e.g. `"3001:80"`)
 
-### Ingest does not pull real data
-Check backend logs:
-```bash
-docker compose logs -f backend --tail=300
-```
-Most common reasons:
-- No internet access from Docker network
-- Source endpoints blocked or changed
-- Timeouts/rate-limits
+**Neo4j won't start / backend shows `neo4j_not_connected`**
+- Wait longer — Neo4j needs 30-60 seconds on first start
+- Check: `docker compose logs neo4j --tail=20`
+- Ensure at least 4 GB RAM is available for Docker
+
+**APR ingest gets stuck or is very slow**
+- Normal — CompanyWall rate-limits to ~1 request/8 seconds
+- Check progress: `docker compose logs backend 2>&1 | grep cw_scrape | tail -5`
+- If backend was restarted mid-scrape, re-run `POST /ingest/apr` — already-scraped companies are cached and skipped
+
+**Ingest returns 404 for `/ingest/op` or `/ingest/vlada`**
+- Rebuild backend: `docker compose build backend && docker compose up -d backend`
+
+**Dashboard shows demo data after ingest**
+- Run `POST /detect/all` to generate alerts
+- Hard-refresh the browser: `Ctrl+Shift+R`
 
 ---
 
-## What should NOT be committed
-This repo is prepared to avoid committing:
-- `.env` (secrets)
-- `node_modules/`
-- virtual environments (`.venv/`)
-- runtime data (`data/`)
+## Architecture
 
-See `.gitignore` for details.
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Frontend      │────▶│   Backend       │────▶│   Neo4j         │
+│   React + D3    │     │   FastAPI       │     │   Graph DB      │
+│   port 3000     │     │   port 8000     │     │   port 7474/7687│
+└─────────────────┘     └────────┬────────┘     └─────────────────┘
+                                  │
+                    ┌─────────────┼─────────────┐
+                    ▼             ▼             ▼
+              JN Portal      Otvoreni       CompanyWall
+              UJN OpenData   Parlament      (APR proxy)
+              Vlada RS       (MPs)          Wikipedia
+```
+
+**Node types:** Person, Company, Institution, Contract, PoliticalParty, Address, Property, BudgetItem
+
+**Key relationships:** EMPLOYED_BY, DIRECTS, OWNS, WON_CONTRACT, AWARDED_CONTRACT, MEMBER_OF, FAMILY_OF, DONATED_TO
+
+---
+
+## What is NOT committed
+
+- `.env` — secrets/passwords
+- `data/` — scraped raw data and Neo4j cache files
+- `node_modules/`, `.venv/` — dependencies
+
+See `.gitignore` for full list.
