@@ -110,19 +110,19 @@ def get_stats():
     Fixed: uses subqueries to avoid cartesian products.
     """
     result = run_query_single("""
-        CALL {
+        CALL () {
             MATCH (p:Person) RETURN count(p) AS persons
         }
-        CALL {
+        CALL () {
             MATCH (c:Company) RETURN count(c) AS companies
         }
-        CALL {
+        CALL () {
             MATCH (ct:Contract) RETURN count(ct) AS contracts
         }
-        CALL {
+        CALL () {
             MATCH (i:Institution) RETURN count(i) AS institutions
         }
-        CALL {
+        CALL () {
             MATCH ()-[r]->() RETURN count(r) AS rels
         }
         RETURN persons, companies, contracts, institutions, rels
@@ -523,22 +523,22 @@ def get_source_stats():
 
     # Also get contract count (contracts have source='procurement' or 'seed')
     contract_rows = run_query("""
-        CALL {
+        CALL () {
             MATCH (n:Company) RETURN count(n) AS companies
         }
-        CALL {
+        CALL () {
             MATCH (n:Contract) RETURN count(n) AS contracts
         }
-        CALL {
+        CALL () {
             MATCH (n:Person) RETURN count(n) AS persons
         }
-        CALL {
+        CALL () {
             MATCH (n:Institution) RETURN count(n) AS institutions
         }
-        CALL {
+        CALL () {
             MATCH (n:BudgetItem) RETURN count(n) AS budgets
         }
-        CALL {
+        CALL () {
             MATCH (n:Property) RETURN count(n) AS properties
         }
         RETURN companies, contracts, persons, institutions, budgets, properties

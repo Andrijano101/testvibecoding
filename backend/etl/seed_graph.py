@@ -671,17 +671,17 @@ def summarize():
     """Return counts of seeded nodes."""
     from backend.api.database import run_query_single
     result = run_query_single("""
-        CALL {
+        CALL () {
             MATCH (n) WHERE n.source = 'seed'
             RETURN count(n) AS seed_nodes
         }
-        CALL {
+        CALL () {
             MATCH (n:Person) WHERE n.source = 'seed' RETURN count(n) AS persons
         }
-        CALL {
+        CALL () {
             MATCH (n:Company) WHERE n.source = 'seed' RETURN count(n) AS companies
         }
-        CALL {
+        CALL () {
             MATCH (n:Contract) WHERE n.source = 'seed' RETURN count(n) AS contracts
         }
         RETURN seed_nodes, persons, companies, contracts

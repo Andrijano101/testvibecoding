@@ -106,7 +106,7 @@ def run_query_paginated(
     Returns {items: [...], total: int, skip: int, limit: int}.
     """
     # Build count query by wrapping
-    count_cypher = f"CALL {{ {cypher} RETURN count(*) AS __total }} RETURN __total"
+    count_cypher = f"CALL () {{ {cypher} RETURN count(*) AS __total }} RETURN __total"
     paginated_cypher = f"{cypher} SKIP $__skip LIMIT $__limit"
 
     full_params = {**(params or {}), "__skip": skip, "__limit": limit}
