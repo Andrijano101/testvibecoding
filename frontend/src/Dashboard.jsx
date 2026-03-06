@@ -463,7 +463,7 @@ function PatternDetailModal({ alert, onClose, onShowOnGraph, onOpenEntity }) {
                       fontFamily: "'IBM Plex Mono', monospace", paddingTop: 1,
                     }}>{label}</span>
                     <span style={{
-                      fontSize: 12, fontWeight: 500, wordBreak: "break-word",
+                      fontSize: 12, wordBreak: "break-word",
                       color: isMonetary ? "#f59e0b" : "#e2e8f0",
                       fontFamily: isMonetary ? "'IBM Plex Mono', monospace" : "inherit",
                       fontWeight: isMonetary ? 700 : 500,
