@@ -1259,7 +1259,7 @@ export default function Dashboard() {
                 ].map(s => {
                   // Primary value: flagged count if available and real data loaded, else total
                   const primaryVal = (!isDemo && flaggedCounts != null) ? (s.flagged ?? 0) : s.total;
-                  const showTotal = !isDemo && flaggedCounts != null && s.total != null && s.total !== primaryVal;
+                  const showTotal = showTestData && !isDemo && flaggedCounts != null && s.total != null && s.total !== primaryVal;
                   return (
                   <div key={s.label}
                     onClick={() => !isDemo && setEntityBrowser({ type: s.type, label: s.label, color: s.color })}
@@ -1287,7 +1287,7 @@ export default function Dashboard() {
               <div style={{ background: "#111827", borderRadius: 8, padding: "10px 12px", marginTop: 6, borderLeft: `3px solid ${SEVERITY_COLORS[riskSummary?.risk_level || "low"]}` }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: SEVERITY_COLORS[riskSummary?.risk_level || "low"], fontFamily: "'IBM Plex Mono', monospace" }}>{alerts.length}</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: SEVERITY_COLORS[riskSummary?.risk_level || "low"], fontFamily: "'IBM Plex Mono', monospace" }}>{filteredAlerts.length}</div>
                     <div style={{ fontSize: 9, color: "#64748b" }}>Upozorenja</div>
                   </div>
                   {riskSummary && (
