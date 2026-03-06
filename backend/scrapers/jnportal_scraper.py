@@ -36,9 +36,10 @@ DATA_DIR = os.getenv("DATA_DIR", "./data")
 SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "1"))
 SCRAPER_TIMEOUT = float(os.getenv("SCRAPER_TIMEOUT", "60"))
 JNPORTAL_BASE = "https://jnportal.ujn.gov.rs"
-JNPORTAL_MAX_ROWS = int(os.getenv("JNPORTAL_MAX_ROWS", "2000"))
-# Only fetch contracts above this value (RSD) to focus on significant ones
-JNPORTAL_MIN_VALUE = float(os.getenv("JNPORTAL_MIN_VALUE", "5000000"))
+JNPORTAL_MAX_ROWS = int(os.getenv("JNPORTAL_MAX_ROWS", "10000"))
+# Lower threshold to catch contract-splitting and threshold-manipulation patterns
+# TS Serbia research (2024): most manipulation happens in 850K-3M RSD range
+JNPORTAL_MIN_VALUE = float(os.getenv("JNPORTAL_MIN_VALUE", "500000"))
 JNPORTAL_PAGE_SIZE = int(os.getenv("JNPORTAL_PAGE_SIZE", "100"))
 
 
@@ -239,6 +240,79 @@ class JNPortalScraper:
             "source": "jnportal",
         }
 
+    def _scrape_phase_proc_type(
+        self,
+        proc_types: List[int],
+        max_rows: int,
+        seen_ids: Optional[set] = None,
+    ) -> tuple:
+        """Phase targeting specific procedure types (e.g. 3=negotiated, 9=direct agreement).
+
+        These are the highest-risk non-competitive procedures. We scrape them separately
+        sorted by TotalValue DESC to get the most significant ones.
+        Since the API filter param doesn't work reliably, we scan pages and filter client-side.
+        """
+        if seen_ids is None:
+            seen_ids = set()
+
+        contracts: List[Dict] = []
+        institutions_map: Dict[str, Dict] = {}
+        skip = 0
+        page_size = JNPORTAL_PAGE_SIZE
+        total_scanned = 0
+        MAX_SCAN = max_rows * 20  # scan up to 20x to find enough matching rows
+
+        logger.info("jnportal_proc_phase_start", proc_types=proc_types, max_rows=max_rows)
+
+        while len(contracts) < max_rows and total_scanned < MAX_SCAN:
+            try:
+                page = self._fetch_page(skip, page_size, sort_field="TotalValue")
+            except Exception as e:
+                logger.error("jnportal_page_failed", skip=skip, error=str(e))
+                break
+
+            rows = page.get("data", [])
+            if not rows:
+                break
+
+            for raw in rows:
+                total_scanned += 1
+                pt = raw.get("ProcedureTypeId")
+                if pt not in proc_types:
+                    continue
+
+                contract_id = f"JNP-{raw.get('Id', '')}"
+                if contract_id in seen_ids:
+                    continue
+
+                rec = self._parse_contract(raw)
+                if rec:
+                    contracts.append(rec)
+                    seen_ids.add(contract_id)
+
+                    inst_pib = re.sub(r"\D", "", str(raw.get("CAIdentificationNumber") or ""))
+                    inst_name = (raw.get("CAName") or "").strip()
+                    if inst_pib and inst_name and inst_pib not in institutions_map:
+                        institutions_map[inst_pib] = {
+                            "institution_id": f"JNP-INST-{inst_pib}",
+                            "name": inst_name, "name_normalized": _norm(inst_name),
+                            "maticni_broj": "", "pib": inst_pib,
+                            "source_url": f"{JNPORTAL_BASE}/contracts",
+                        }
+
+                if len(contracts) >= max_rows:
+                    break
+
+            if len(rows) < page_size:
+                break
+
+            skip += page_size
+            time.sleep(SCRAPE_DELAY * 0.5)
+
+        logger.info("jnportal_proc_phase_done",
+                    proc_types=proc_types, found=len(contracts), scanned=total_scanned)
+        return contracts, institutions_map
+
     def scrape(
         self,
         max_rows: int = JNPORTAL_MAX_ROWS,
@@ -246,12 +320,14 @@ class JNPortalScraper:
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
-        Dual-pass scrape:
-          Phase 1 — sorted by TotalValue DESC, stops at min_value.
-                    Gets all high-value contracts (typically ~700).
+        Three-phase scrape strategy:
+          Phase 1 — sorted by TotalValue DESC, stops at min_value (default 500K RSD).
+                    Gets all high-value contracts.
           Phase 2 — sorted by ContractDate DESC, no value filter.
-                    Gets the most recent contracts that have a contractor name,
-                    up to max_rows - phase1_count (deduplicating by contract ID).
+                    Gets the most recent contracts.
+          Phase 3 — scan for proc_type 3 (negotiated) + 9 (direct agreement).
+                    Targets non-competitive contracts regardless of value.
+                    These are the highest-risk for corruption.
         """
         cache_path = os.path.join(DATA_DIR, "raw", "cache", "jnportal_contracts.json")
         if not force_refresh and os.path.exists(cache_path):
@@ -265,28 +341,41 @@ class JNPortalScraper:
                     "scraped_at": "cached",
                 })
 
-        # Phase 1: high-value contracts sorted by TotalValue DESC
         seen_ids: set = set()
+
+        # Phase 1: high-value contracts sorted by TotalValue DESC
+        phase1_quota = max_rows // 2
         phase1_contracts, phase1_insts = self._scrape_phase(
             "TotalValue",
-            max_rows=max_rows,
+            max_rows=phase1_quota,
             min_value=min_value,
             require_contractor=False,
             seen_ids=seen_ids,
         )
+        logger.info("jnportal_phase1_done", count=len(phase1_contracts))
 
         # Phase 2: recent contracts sorted by ContractDate DESC
-        remaining = max(0, max_rows - len(phase1_contracts))
+        phase2_quota = max_rows // 4
         phase2_contracts, phase2_insts = self._scrape_phase(
             "ContractDate",
-            max_rows=remaining,
+            max_rows=phase2_quota,
             min_value=0,
             require_contractor=True,
             seen_ids=seen_ids,
         )
+        logger.info("jnportal_phase2_done", count=len(phase2_contracts))
 
-        contracts = phase1_contracts + phase2_contracts
-        institutions_map = {**phase1_insts, **phase2_insts}
+        # Phase 3: non-competitive contracts (proc_type 3 and 9) — critical for corruption detection
+        phase3_quota = max_rows // 4
+        phase3_contracts, phase3_insts = self._scrape_phase_proc_type(
+            proc_types=[3, 9],
+            max_rows=phase3_quota,
+            seen_ids=seen_ids,
+        )
+        logger.info("jnportal_phase3_done", count=len(phase3_contracts))
+
+        contracts = phase1_contracts + phase2_contracts + phase3_contracts
+        institutions_map = {**phase1_insts, **phase2_insts, **phase3_insts}
 
         # Save outputs
         out_contracts = os.path.join(DATA_DIR, "raw", "ujn", "jnportal_contracts.json")
@@ -301,6 +390,7 @@ class JNPortalScraper:
             "total_institutions": len(institutions_map),
             "phase1_by_value": len(phase1_contracts),
             "phase2_by_date": len(phase2_contracts),
+            "phase3_noncompetitive": len(phase3_contracts),
             "min_value_rsd": min_value,
             "max_rows": max_rows,
             "scraped_at": datetime.utcnow().isoformat(),
@@ -312,5 +402,6 @@ class JNPortalScraper:
                     total=len(contracts),
                     phase1=len(phase1_contracts),
                     phase2=len(phase2_contracts),
+                    phase3=len(phase3_contracts),
                     institutions=len(institutions_map))
         return summary
