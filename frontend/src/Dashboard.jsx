@@ -162,6 +162,7 @@ const PATTERN_EXPLANATIONS = {
       { key: "institution", label: "Naručilac" },
       { key: "winner", label: "Pobednik" },
       { key: "proc_type", label: "Vrsta nabavke" },
+      { key: "directors", label: "Direktor(i) firme" },
     ],
   },
   revolving_door: {
@@ -241,6 +242,8 @@ const PATTERN_EXPLANATIONS = {
     fields: [
       { key: "company_name", label: "Stalni pobednik" },
       { key: "institution", label: "Institucija" },
+      { key: "directors", label: "Direktor(i) firme" },
+      { key: "company_founded", label: "Datum osnivanja firme" },
       { key: "win_count", label: "Broj pobeda" },
       { key: "total_value", label: "Ukupna vrednost" },
       { key: "first_win", label: "Prva pobeda" },
@@ -258,6 +261,7 @@ const PATTERN_EXPLANATIONS = {
     fields: [
       { key: "company_name", label: "Firma" },
       { key: "founded", label: "Datum osnivanja" },
+      { key: "directors", label: "Direktor(i) firme" },
       { key: "age_at_award", label: "Starost firme (god.)" },
       { key: "num_contracts", label: "Broj ugovora" },
       { key: "total_value", label: "Ukupna vrednost" },
@@ -326,6 +330,8 @@ const PATTERN_EXPLANATIONS = {
     fields: [
       { key: "institution", label: "Institucija" },
       { key: "company_name", label: "Dominantni dobavljač" },
+      { key: "directors", label: "Direktor(i) firme" },
+      { key: "company_founded", label: "Datum osnivanja firme" },
       { key: "company_pct_of_institution", label: "Udeo u budžetu (%)" },
       { key: "company_total_value", label: "Vrednost ugovora firme" },
       { key: "institution_total_value", label: "Ukupan budžet institucije" },
@@ -398,6 +404,7 @@ function PatternDetailModal({ alert, onClose, onShowOnGraph, onOpenEntity }) {
     if (val == null || val === "") return null;
     const isMonetary = key.includes("value") || key.includes("amount") || key.includes("total_value");
     if (isMonetary) return formatRSD(val);
+    if (Array.isArray(val)) return val.length ? val.join(", ") : null;
     return String(val);
   };
 
@@ -1462,12 +1469,12 @@ export default function Dashboard() {
                   display: "flex", alignItems: "center", gap: 4,
                 }}>
                   <span style={{ fontSize: 10 }}>{icon}</span> {label}
-                  {key === "alerts" && alerts.length > 0 && (
+                  {key === "alerts" && filteredAlerts.length > 0 && (
                     <span style={{
                       fontSize: 8, background: SEVERITY_COLORS[riskSummary?.risk_level || "low"] + "33",
                       color: SEVERITY_COLORS[riskSummary?.risk_level || "low"],
                       padding: "1px 5px", borderRadius: 3, fontWeight: 700,
-                    }}>{alerts.length}</span>
+                    }}>{filteredAlerts.length}</span>
                   )}
                 </button>
               ))}

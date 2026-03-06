@@ -418,6 +418,88 @@ async def ingest_apr_directors(background_tasks: BackgroundTasks, force_refresh:
     return {"status": "started", "message": "APR director enrichment running in background"}
 
 
+@app.post("/enrich/suspicious-directors")
+async def enrich_suspicious_directors(background_tasks: BackgroundTasks):
+    """
+    Find suspicious companies (from all detection patterns) that have no director data
+    in the graph, then scrape CW for exactly those companies and load results.
+
+    This is a targeted enrichment — only scrapes the ~100 risky companies
+    that are missing director/owner info.
+    """
+    # Find suspicious company PIBs without director data
+    q = """
+    MATCH (co:Company)
+    WHERE co.pib IS NOT NULL AND co.pib <> ''
+      AND co.pib <> 'SEED'
+      AND NOT co.pib STARTS WITH 'MB-SEED'
+      AND NOT ((:Person)-[:DIRECTS|OWNS]->(co))
+      AND (
+        (co)-[:WON_CONTRACT]->(:Contract)
+      )
+    RETURN co.pib AS pib, co.name AS name
+    LIMIT 500
+    """
+    rows = run_query(q)
+    pibs = [r["pib"] for r in rows if r.get("pib")]
+
+    if not pibs:
+        return {"status": "no_work", "message": "All suspicious companies already have director data"}
+
+    logger.info("enrich_suspicious_directors_start", count=len(pibs))
+
+    def _run():
+        import time, json, os
+        from backend.scrapers.companywall_scraper import CompanyWallScraper
+        from backend.etl.graph_loader import GraphLoader
+
+        scraper = CompanyWallScraper()
+        DATA_DIR = os.getenv("DATA_DIR", "./data")
+        apr_saved = 0
+
+        for i, pib in enumerate(pibs):
+            apr_path = os.path.join(DATA_DIR, "raw", "apr", f"{pib}.json")
+            # skip fresh cache (< 48 h)
+            if os.path.exists(apr_path):
+                age_h = (time.time() - os.path.getmtime(apr_path)) / 3600
+                if age_h < 48:
+                    continue
+
+            logger.info("enrich_cw_scrape", pib=pib, i=i + 1, total=len(pibs))
+            firma_url = scraper._search(pib)
+            if not firma_url:
+                time.sleep(1)
+                continue
+            time.sleep(1)
+            company = scraper._scrape_company_page(firma_url, pib)
+            if not company:
+                time.sleep(2)
+                continue
+
+            apr_record = {k: v for k, v in company.items() if k != "properties"}
+            apr_record["source"] = "apr"
+            if "maticni_broj" not in apr_record:
+                apr_record["maticni_broj"] = pib
+            os.makedirs(os.path.dirname(apr_path), exist_ok=True)
+            with open(apr_path, "w", encoding="utf-8") as f:
+                json.dump(apr_record, f, ensure_ascii=False, indent=2)
+            apr_saved += 1
+            time.sleep(2)
+
+        # Reload CW data into Neo4j
+        loader = GraphLoader()
+        loader.load_companywall_data()
+        loader.close()
+        logger.info("enrich_suspicious_directors_done", scraped=apr_saved, total=len(pibs))
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "started",
+        "companies_to_enrich": len(pibs),
+        "message": f"Scraping CW for {len(pibs)} suspicious companies without director data"
+    }
+
+
 @app.get("/detect/all")
 def detect_all():
     """Run all detection patterns and return summary with risk scoring."""
@@ -1054,13 +1136,441 @@ def ingest_source(
 
 
 # ── Export ──────────────────────────────────────────────────────
+
+# Pattern metadata for rich HTML export — mirrors PATTERN_EXPLANATIONS in Dashboard.jsx
+_PATTERN_META: dict = {
+    "conflict_of_interest": {
+        "icon": "⚖", "title": "Sukob interesa",
+        "why": (
+            "Funkcioner koji direktno odlučuje o dodeli ugovora ima porodičnog člana koji je vlasnik "
+            "ili direktor firme koja je dobila taj ugovor od iste institucije. Ovo je klasičan obrazac "
+            "korupcije koji narušava princip nepristrasnosti u javnim nabavkama."
+        ),
+        "how": (
+            "(Funkcioner)-[EMPLOYED_BY]->(Institucija)\n"
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "(Porodični član)-[OWNS|DIRECTS]->(Firma)\n"
+            "(Funkcioner)-[FAMILY_OF]-(Porodični član)\n\n"
+            "Svi čvorovi moraju biti istovremeno prisutni."
+        ),
+        "sources": [
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+            ("Javni funkcioneri — data.gov.rs", "https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/"),
+        ],
+        "fields": [
+            ("official_name", "Funkcioner"), ("official_role", "Pozicija"),
+            ("institution", "Institucija"), ("family_member", "Porodični član"),
+            ("company_name", "Firma"), ("contract_title", "Ugovor"),
+            ("contract_value", "Vrednost ugovora"), ("award_date", "Datum dodele"),
+        ],
+    },
+    "ghost_employee": {
+        "icon": "👻", "title": "Fantomski zaposleni",
+        "why": (
+            "Isto lice pojavljuje se u platnom spisku dve ili više različitih institucija sa različitim "
+            "identifikatorima. Ukazuje na lažno zaposlenje ili isplatu plata za nepostojeće radnike."
+        ),
+        "how": (
+            "(P1:Person {name_normalized: X})-[EMPLOYED_BY]->(I1)\n"
+            "(P2:Person {name_normalized: X})-[EMPLOYED_BY]->(I2)\n"
+            "gde P1.person_id != P2.person_id i I1 != I2"
+        ),
+        "sources": [
+            ("Javni funkcioneri — data.gov.rs", "https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/"),
+            ("Službeni glasnik", "https://www.pravno-informacioni-sistem.rs/SlGlasnikPortal/eli/collection"),
+            ("Poslanici — Parlament RS", "https://www.parlament.gov.rs/members-of-parliament"),
+        ],
+        "fields": [
+            ("name_1", "Ime (evidencija 1)"), ("institution_1", "Institucija 1"),
+            ("name_2", "Ime (evidencija 2)"), ("institution_2", "Institucija 2"),
+            ("normalized_name", "Normalizovano ime"),
+        ],
+    },
+    "shell_company_cluster": {
+        "icon": "🐚", "title": "Klaster shell kompanija",
+        "why": (
+            "Tri ili više firmi registrovanih na istoj adresi kolektivno osvajaju javne ugovore. "
+            "Čest mehanizam za rasipanje ugovora između povezanih firmi radi zaobilaženja pragova nabavki."
+        ),
+        "how": (
+            "(Adresa)<-[REGISTERED_AT]-(C1)\n"
+            "(Adresa)<-[REGISTERED_AT]-(C2)\n"
+            "(Adresa)<-[REGISTERED_AT]-(C3...)\n"
+            "Gde svaka kompanija ima WON_CONTRACT odnos.\n"
+            "Suma vrednosti svih ugovora = ukupna izloženost."
+        ),
+        "sources": [
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("address", "Zajednička adresa"), ("city", "Grad"),
+            ("num_companies", "Broj firmi"), ("num_contracts", "Broj ugovora"),
+            ("total_value", "Ukupna vrednost"),
+        ],
+    },
+    "single_bidder": {
+        "icon": "1️⃣", "title": "Ugovor sa jednim ponuđačem",
+        "why": (
+            "Javna nabavka primila je samo jednu ponudu, što drastično smanjuje konkurenciju. "
+            "Posebno sumnjivo kada se ponavlja sa istom firmom ili institucijom, ili kada je vrednost visoka. "
+            "Proc tip 3 ili 9 u srpskom zakonu = pregovarački postupak bez prethodnog objavljivanja — "
+            "konkurentno nadmetanje je zaobiđeno."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor {num_bidders: 1})\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "gde Ugovor.value_rsd >= prag (podrazumevano 2.000.000 RSD)"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("contract_title", "Naziv ugovora"), ("value_rsd", "Vrednost"),
+            ("award_date", "Datum dodele"), ("institution", "Naručilac"),
+            ("winner", "Pobednik"), ("proc_type", "Vrsta nabavke"),
+            ("directors", "Direktor(i) firme"),
+        ],
+    },
+    "revolving_door": {
+        "icon": "🔄", "title": "Rotirajuća vrata",
+        "why": (
+            "Bivši državni funkcioner napustio je instituciju i preuzeo rukovodeću poziciju u privatnoj firmi "
+            "koja potom dobija ugovore od te iste institucije. Lice koristi insajderska znanja i poslovne "
+            "kontakte stečene tokom rada u državnoj upravi."
+        ),
+        "how": (
+            "(Osoba)-[EMPLOYED_BY {until: datum}]->(Institucija)\n"
+            "(Osoba)-[DIRECTS|OWNS {since: datum >= until}]->(Firma)\n"
+            "OPCIONALNO:\n"
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)"
+        ),
+        "sources": [
+            ("Službeni glasnik", "https://www.pravno-informacioni-sistem.rs/SlGlasnikPortal/eli/collection"),
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("person_name", "Osoba"), ("former_institution", "Bivša institucija"),
+            ("govt_role", "Bivša pozicija"), ("left_govt", "Datum odlaska"),
+            ("company_name", "Nova firma"), ("company_role", "Nova pozicija"),
+            ("joined_company", "Datum ulaska"), ("contracts_between", "Ugovora između"),
+            ("total_contract_value", "Ukupna vrednost"),
+        ],
+    },
+    "budget_self_allocation": {
+        "icon": "💰", "title": "Samododeljivanje budžeta",
+        "why": (
+            "Funkcioner je odobrio budžetsku stavku, a ugovor finansiran iz te stavke dobila je firma "
+            "sa kojom ima porodičnu ili vlasničku vezu. Direktni sukob interesa na nivou budžetskog procesa."
+        ),
+        "how": (
+            "(Osoba)-[ALLOCATED_BY]-(BudžetStavka)\n"
+            "(BudžetStavka)-[FUNDS]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "Gde postoji put dužine 1-3 između Osobe i Firme\n"
+            "kroz FAMILY_OF, OWNS ili DIRECTS odnose."
+        ),
+        "sources": [
+            ("Budžet RS — Ministarstvo finansija", "https://www.mfin.gov.rs/dokumenti/budzet/"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+        ],
+        "fields": [
+            ("allocator", "Odobrio budžet"), ("budget_item", "Budžetska stavka"),
+            ("amount", "Iznos"), ("contract_title", "Ugovor"),
+            ("beneficiary_company", "Korisnik"),
+        ],
+    },
+    "contract_splitting": {
+        "icon": "✂", "title": "Deljenje ugovora",
+        "why": (
+            "Ista firma dobija više ugovora od iste institucije u kratkom vremenskom periodu, pri čemu su svi "
+            "ispod zakonskog praga za obaveznu javnu licitaciju. Zbir vrednosti prelazi prag — klasičan način "
+            "zaobilaženja procedure. Zakon o javnim nabavkama zabranjuje veštačko deljenje predmeta nabavke."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(CT1, CT2...)\n"
+            "(Firma)-[WON_CONTRACT]->(CT1, CT2...)\n"
+            "gde: CT.value_rsd < prag (npr. 6M)\n"
+            "  i: count >= 2\n"
+            "  i: svi ugovori u roku od 90 dana"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("institution", "Institucija"), ("company_name", "Firma"),
+            ("num_contracts", "Broj ugovora"), ("total_value", "Ukupna vrednost"),
+            ("first_date", "Prvi ugovor"), ("last_date", "Poslednji ugovor"),
+        ],
+    },
+    "political_donor_contract": {
+        "icon": "🤝", "title": "Donator stranke → Ugovor",
+        "why": (
+            "Firma koja je finansirala političku stranku osvaja javne ugovore od institucija kojima rukovode "
+            "članovi te stranke. Obrazac poznat kao 'pay-to-play' — donacija kao investicija u buduće ugovore."
+        ),
+        "how": (
+            "(Firma)-[DONATED_TO]->(PolitičkaStranka)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "OPCIONALNO:\n"
+            "(Osoba)-[MEMBER_OF]->(PolitičkaStranka)\n"
+            "(Osoba)-[EMPLOYED_BY]->(Institucija)"
+        ),
+        "sources": [
+            ("Finansiranje stranaka — ACAS", "https://www.acas.rs/finansiranje-politickih-subjekata/"),
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("donor_company", "Donator"), ("party_name", "Stranka"),
+            ("donation_amount", "Iznos donacije"), ("contract_title", "Dobijeni ugovor"),
+            ("contract_value", "Vrednost ugovora"), ("awarding_institution", "Institucija"),
+            ("party_member_in_institution", "Član stranke u instituciji"),
+        ],
+    },
+    "repeated_winner": {
+        "icon": "🏆", "title": "Stalni pobednik",
+        "why": (
+            "Ista firma pobeđuje na javnim nabavkama kod iste institucije više puta zaredom, osvajajući "
+            "dominantan deo njenog ukupnog budžeta za nabavke. U zdravom sistemu, različite firme trebalo bi "
+            "da pobede u različitim raspisima — stalno isti pobednik ukazuje na sistemsko zarobljavanje "
+            "nabavnog procesa, pisanje konkursa po meri firme, ili korupciju evaluacione komisije.\n\n"
+            "Zakon o javnim nabavkama Srbije propisuje princip konkurentnosti — ponavljano osvajanje od "
+            "jednog ponuđača je signal za reviziju i istragu."
+        ),
+        "how": (
+            "(Firma)-[WON_CONTRACT]->(CT1, CT2, CT3...)\n"
+            "(Institucija)-[AWARDED_CONTRACT]->(CT1, CT2, CT3...)\n"
+            "gde: count(ugovori firma/institucija) >= 3\n"
+            "  i: firma.ugovori / institucija.ukupno_ugovora >= 50%"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("company_name", "Stalni pobednik"), ("institution", "Institucija"),
+            ("directors", "Direktor(i) firme"),
+            ("company_founded", "Datum osnivanja firme"),
+            ("num_contracts", "Broj pobeda"), ("total_value", "Ukupna vrednost"),
+            ("first_win", "Prva pobeda"), ("last_win", "Poslednja pobeda"),
+            ("share_pct", "% budžeta institucije"),
+        ],
+    },
+    "new_company_big_contract": {
+        "icon": "🆕", "title": "Nova firma — veliki ugovor",
+        "why": (
+            "Novoosnovana firma (mlađa od 3 godine) osvaja javne ugovore visoke vrednosti bez dokazanog "
+            "iskustva i poslovne istorije. Zakon o javnim nabavkama zahteva od ponuđača dokaze o referentnim "
+            "ugovorima i finansijskom kapacitetu — pa se nameće pitanje kako firma bez istorije ispunjava "
+            "te uslove.\n\n"
+            "Karakteristični scenariji:\n"
+            "• Firma osnovana neposredno pre raspisivanja konkursa — napravljena posebno za taj tender\n"
+            "• Ishodišna firma: postojeći direktor osniva novu firmu i 'prebacuje' ugovore na nju\n"
+            "• Politički podobna firma: veze ka stranci koja kontroliše instituciju\n"
+            "• 'Školjka': nova firma nema zaposlenih — posao obavljaju kooperanti"
+        ),
+        "how": (
+            "(Firma)-[:WON_CONTRACT]->(Ugovor)\n"
+            "gde: Firma.founding_date IS NOT NULL\n"
+            "  i: award_year - founding_year <= 3\n"
+            "  i: contract_value >= 2.000.000 RSD\n\n"
+            "Severity:\n"
+            "  age = 0 (ista godina osnivanja): CRITICAL\n"
+            "  age <= 1 + value >= 5M: CRITICAL\n"
+            "  age <= 2: HIGH\n"
+            "  age = 3: MEDIUM"
+        ),
+        "sources": [
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("company_name", "Firma"), ("founded", "Datum osnivanja"),
+            ("directors", "Direktor(i) firme"),
+            ("age_at_award", "Starost firme (god.)"), ("num_contracts", "Broj ugovora"),
+            ("total_value", "Ukupna vrednost"), ("contract_title", "Najveći ugovor"),
+            ("contract_value", "Vrednost najvećeg"), ("award_date", "Datum dodele"),
+            ("institution", "Naručilac"),
+        ],
+    },
+    "samododeljivanje_proxy": {
+        "icon": "🏛", "title": "Poslanik/Funkcioner — direktor firme koja dobija ugovore",
+        "why": (
+            "Narodni poslanik ili javni funkcioner istovremeno obavlja direktorsku funkciju u firmi koja "
+            "osvaja javne ugovore. Ovo je direktni sukob interesa — zakon o javnim nabavkama zahteva "
+            "nepristrasnost, ali lice koje kontroliše firmu može koristiti politički uticaj da osigura "
+            "ugovore.\n\n"
+            "Primer: Dušan Bajatović (poslanik SPS) generalni je direktor JP Srbijagasa, koji dobija "
+            "ugovore vredne milijarde RSD."
+        ),
+        "how": (
+            "(Poslanik/Funkcioner)-[EMPLOYED_BY]->(Skupština/Vlada)\n"
+            "(Poslanik/Funkcioner)-[DIRECTS]->(Firma)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "(BilokojInstitucija)-[AWARDED_CONTRACT]->(Ugovor)\n\n"
+            "Ne zahteva da institucija koja zapošljava bude ista koja dodeljuje ugovor —\n"
+            "politički uticaj deluje posredno."
+        ),
+        "sources": [
+            ("Poslanici — Parlament RS", "https://www.parlament.gov.rs/members-of-parliament"),
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("official_name", "Poslanik/Funkcioner"), ("official_role", "Javna pozicija"),
+            ("employer_institution", "Institucija"),
+            ("company_name", "Firma kojom rukovodi"),
+            ("contract_title", "Ugovor"), ("contract_value", "Vrednost ugovora"),
+            ("awarding_institution", "Naručilac"), ("award_date", "Datum dodele"),
+        ],
+    },
+    "direct_official_contractor": {
+        "icon": "⚡", "title": "Funkcioner direktno na obe strane ugovora",
+        "why": (
+            "Isti funkcioner je zaposlen u instituciji koja dodeljuje ugovor I istovremeno rukovodi firmom "
+            "koja taj ugovor dobija — bez posrednika. Najdirektniji oblik sukoba interesa: ista osoba "
+            "kontroliše i naručioca i dobavljača."
+        ),
+        "how": (
+            "(Funkcioner)-[EMPLOYED_BY]->(Institucija)\n"
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "(Funkcioner)-[DIRECTS|OWNS]->(Firma)\n\n"
+            "Svi elementi moraju biti isti — Funkcioner je i kod naručioca i u firmi pobedniku."
+        ),
+        "sources": [
+            ("Javni funkcioneri — data.gov.rs", "https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/"),
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("official_name", "Funkcioner"), ("official_role", "Pozicija"),
+            ("institution", "Institucija naručilac"), ("company_name", "Firma"),
+            ("contract_title", "Ugovor"), ("contract_value", "Vrednost"),
+            ("award_date", "Datum"),
+        ],
+    },
+    "ghost_director": {
+        "icon": "👤", "title": "Fantomski direktor",
+        "why": (
+            "Lice je formalno direktor više firmi koje zajedno osvajaju ugovore od iste institucije — "
+            "ali nema fizičku mogućnost da stvarno rukovodi svima. Čest obrazac pri korišćenju 'front' "
+            "kompanija: nominalni direktor potpisuje dokumenta, a stvarni vlasnik ostaje u senci."
+        ),
+        "how": (
+            "(Osoba)-[DIRECTS]->(Firma1)\n"
+            "(Osoba)-[DIRECTS]->(Firma2)\n"
+            "(Firma1)-[WON_CONTRACT]->(Ugovor1)\n"
+            "(Firma2)-[WON_CONTRACT]->(Ugovor2)\n"
+            "(IstaInstitucija)-[AWARDED_CONTRACT]->(Ugovor1)\n"
+            "(IstaInstitucija)-[AWARDED_CONTRACT]->(Ugovor2)\n\n"
+            "Najmanje 2 firme, iste institucije."
+        ),
+        "sources": [
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("director_name", "Direktor"), ("institution", "Institucija"),
+            ("num_companies", "Broj firmi"), ("total_value", "Ukupna vrednost"),
+        ],
+    },
+    "institutional_monopoly": {
+        "icon": "🏛", "title": "Institucionalni monopol",
+        "why": (
+            "Jedna firma prima 70% ili više celokupnog budžeta javnih nabavki jedne institucije. "
+            "Ovo nije slučajnost — ukazuje na sistemsko zarobljavanje nabavnog procesa:\n\n"
+            "• Konkursna dokumentacija konstruisana tako da samo jedna firma može ispuniti uslove\n"
+            "• Evaluatori imaju uputstvo ili implicitni pritisak da biraju unapred određenog pobednika\n"
+            "• Institucija je u neformalno zavisnom odnosu sa firmom\n"
+            "• Ostale firme su naučile da ne apliciraju jer znaju da nemaju šanse\n\n"
+            "Prema EU standardima i SIGMA metodologiji, koncentracija > 50% kod jednog dobavljača "
+            "za jednu instituciju se klasifikuje kao crvena zastavica za korupciju."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n\n"
+            "AGREGACIJA:\n"
+            "  udeo = firma_vrednost / institucija_ukupno\n\n"
+            "USLOV:\n"
+            "  udeo >= 0.60  (firma dobija >= 60% budžeta)\n"
+            "  firma_vrednost >= 2.000.000 RSD"
+        ),
+        "sources": [
+            ("Portal javnih nabavki (UJN)", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("institution", "Institucija"), ("company_name", "Dominantni dobavljač"),
+            ("directors", "Direktor(i) firme"),
+            ("company_founded", "Datum osnivanja firme"),
+            ("company_pct_of_institution", "Udeo u budžetu (%)"),
+            ("company_total_value", "Vrednost ugovora firme"),
+            ("institution_total_value", "Ukupan budžet institucije"),
+            ("num_contracts", "Broj ugovora"),
+        ],
+    },
+}
+
+_PATTERN_ALIASES: dict = {
+    "conflicts": "conflict_of_interest",
+    "ghosts": "ghost_employee",
+    "shells": "shell_company_cluster",
+    "budget_allocation": "budget_self_allocation",
+    "donor_contracts": "political_donor_contract",
+}
+
+_PROC_TYPE_LABELS: dict = {
+    "1": "Otvoreni postupak",
+    "2": "Restriktivni postupak",
+    "3": "Pregovarački bez objavljivanja poziva ⚑",
+    "4": "Takmičarski dijalog",
+    "5": "Partnerstvo za inovacije",
+    "6": "Okvirni sporazum",
+    "7": "Sistem dinamične nabavke",
+    "8": "Konkurs za dizajn",
+    "9": "Direktni sporazum / Jednostavna nabavka ⚑",
+}
+
+
+def _fmt_rsd(val) -> str:
+    try:
+        n = float(val)
+        if n >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.2f}B RSD"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M RSD"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f}K RSD"
+        return f"{int(n):,} RSD"
+    except Exception:
+        return str(val)
+
+
+def _is_seed(finding: dict) -> bool:
+    seed_fields = ["official_id", "family_id", "company_mb", "winner_mb",
+                   "contract_id", "person_id", "institution_id", "director_id"]
+    return any(
+        str(finding.get(f, "")).upper().startswith(
+            ("PERSON-SEED", "MB-SEED", "CT-SEED", "INST-SEED", "ADDR-SEED")
+        )
+        for f in seed_fields
+        if finding.get(f)
+    )
+
+
 @app.get("/export/findings")
-def export_findings(format: str = "json"):
+def export_findings(format: str = "json", exclude_seed: bool = False):
     """
     Export all detection findings.
     format: json | csv | html
+    exclude_seed: if true, strip synthetic seed/test data from results
     """
-    # Run all detectors
     from backend.queries import detection as det
     results = {}
     detectors = det.ALL_DETECTORS + [
@@ -1086,29 +1596,31 @@ def export_findings(format: str = "json"):
         for p in patterns:
             all_findings.append({**p, "pattern_type": p.get("pattern_type", pattern_name)})
 
-    if format == "csv":
-        # Build CSV with all common fields
-        fieldnames = ["pattern_type", "severity", "official_name", "institution", "family_member",
-                      "company_name", "contract_title", "contract_value", "value_rsd", "total_value",
-                      "award_date", "winner", "person_name", "party_name", "donation_amount",
-                      "num_contracts", "address", "normalized_name", "verification_url"]
+    if exclude_seed:
+        all_findings = [f for f in all_findings if not _is_seed(f)]
 
+    if format == "csv":
+        fieldnames = [
+            "pattern_type", "severity", "official_name", "institution", "family_member",
+            "company_name", "contract_title", "contract_value", "value_rsd", "total_value",
+            "award_date", "winner", "person_name", "party_name", "donation_amount",
+            "num_contracts", "address", "normalized_name", "verification_url", "contract_id",
+        ]
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         for finding in all_findings:
             writer.writerow(finding)
-
         output.seek(0)
         return StreamingResponse(
             iter([output.getvalue()]),
             media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=findings_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"}
+            headers={"Content-Disposition": f"attachment; filename=findings_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"},
         )
 
     elif format == "html":
         risk = det.compute_risk_summary({k: {"patterns": v} for k, v in results.items()})
-        html = _build_html_report(all_findings, risk)
+        html = _build_html_report(all_findings, risk, exclude_seed)
         return HTMLResponse(content=html)
 
     else:  # json
@@ -1116,6 +1628,7 @@ def export_findings(format: str = "json"):
         return {
             "exported_at": datetime.utcnow().isoformat(),
             "total_findings": len(all_findings),
+            "exclude_seed": exclude_seed,
             "risk_summary": risk,
             "findings": all_findings,
             "sources": {
@@ -1125,177 +1638,294 @@ def export_findings(format: str = "json"):
                 "party_financing": "https://www.acas.rs/finansiranje-politickih-subjekata/",
                 "gazette": "https://www.pravno-informacioni-sistem.rs/SlGlasnikPortal/eli/collection",
                 "parliament": "https://www.parlament.gov.rs/members-of-parliament",
-            }
+            },
         }
 
 
-def _build_html_report(findings: list, risk: dict) -> str:
-    """Build a printable HTML report of all findings."""
-    severity_colors = {"critical": "#dc2626", "high": "#f97316", "medium": "#eab308", "low": "#6b7280"}
-    pattern_labels = {
-        "conflict_of_interest": "Sukob interesa", "single_bidder": "Jedan ponuđač",
-        "contract_splitting": "Deljenje ugovora", "revolving_door": "Rotirajuća vrata",
-        "ghost_employee": "Fantomski zaposleni", "shell_company_cluster": "Shell kompanije",
-        "budget_self_allocation": "Samododeljivanje", "political_donor_contract": "Donator→Ugovor",
-        "conflicts": "Sukob interesa", "ghosts": "Fantomski zaposleni", "shells": "Shell kompanije",
-        "budget_allocation": "Samododeljivanje", "donor_contracts": "Donator→Ugovor",
+def _build_html_report(findings: list, risk: dict, exclude_seed: bool = False) -> str:
+    """Build a detailed printable HTML report mirroring the Upozorenja detail panel."""
+    SEV_PALETTE = {
+        "critical": {"bg": "#fef2f2", "border": "#dc2626", "text": "#dc2626", "badge": "#fee2e2"},
+        "high":     {"bg": "#fff7ed", "border": "#f97316", "text": "#c2410c", "badge": "#ffedd5"},
+        "medium":   {"bg": "#fefce8", "border": "#ca8a04", "text": "#a16207", "badge": "#fef9c3"},
+        "low":      {"bg": "#f9fafb", "border": "#6b7280", "text": "#4b5563", "badge": "#f3f4f6"},
     }
+    SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    sorted_findings = sorted(findings, key=lambda f: SEV_ORDER.get(f.get("severity", "low"), 9))
 
-    # Real portal URLs per pattern — used to generate Izvor links in the report
-    pattern_portals: dict = {
-        "conflict_of_interest": [
-            ("APR — vlasnici i direktori firmi", "https://pretraga.apr.gov.rs"),
-            ("Portal javnih nabavki — ugovori", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-            ("Javni funkcioneri — data.gov.rs", "https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/"),
-        ],
-        "ghost_employee": [
-            ("Javni funkcioneri — data.gov.rs", "https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/"),
-            ("Službeni glasnik — postavljenja", "https://www.pravno-informacioni-sistem.rs/SlGlasnikPortal/eli/collection"),
-            ("Imovinski registar — ACAS", "https://www.acas.rs/imovinski-registar/"),
-        ],
-        "shell_company_cluster": [
-            ("APR — registrovane adrese", "https://pretraga.apr.gov.rs"),
-            ("Portal javnih nabavki — ugovori", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-        ],
-        "single_bidder": [
-            ("Portal javnih nabavki — pregled nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-        ],
-        "revolving_door": [
-            ("Službeni glasnik — razrešenja", "https://www.pravno-informacioni-sistem.rs/SlGlasnikPortal/eli/collection"),
-            ("APR — direktorska imenovanja", "https://pretraga.apr.gov.rs"),
-            ("Portal javnih nabavki — ugovori", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-        ],
-        "budget_self_allocation": [
-            ("Budžet RS — Ministarstvo finansija", "https://www.mfin.gov.rs/dokumenti/budzet/"),
-            ("Portal javnih nabavki — ugovori", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-            ("APR — vlasnici firmi", "https://pretraga.apr.gov.rs"),
-        ],
-        "contract_splitting": [
-            ("Portal javnih nabavki — hronologija", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-        ],
-        "political_donor_contract": [
-            ("ACAS — finansiranje stranaka", "https://www.acas.rs/finansiranje-politickih-subjekata/"),
-            ("APR — donatori", "https://pretraga.apr.gov.rs"),
-            ("Portal javnih nabavki — ugovori", "https://jnportal.ujn.gov.rs/tender-documents/search"),
-        ],
-    }
-    # Normalize aliases
-    for alias, canonical in [("conflicts", "conflict_of_interest"), ("ghosts", "ghost_employee"),
-                              ("shells", "shell_company_cluster"), ("budget_allocation", "budget_self_allocation"),
-                              ("donor_contracts", "political_donor_contract")]:
-        pattern_portals[alias] = pattern_portals.get(canonical, [])
+    def _esc(s: str) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
-    def _portals_html(pattern_type: str, finding: dict) -> str:
-        links = []
-        # Direct APR link if we have a real-looking maticni_broj
-        mb = finding.get("company_mb") or finding.get("winner_mb")
-        if mb and not mb.startswith("MB-SEED"):
-            links.append(f'<a href="https://pretraga.apr.gov.rs/unifiedsearch?searchTerm={mb}" target="_blank" '
-                         f'style="color:#2563eb;text-decoration:none;font-size:11px;display:block;margin-bottom:3px">'
-                         f'↗ APR pretraga: {mb}</a>')
-        # Pattern-specific portals
-        for label, url in pattern_portals.get(pattern_type, []):
-            links.append(f'<a href="{url}" target="_blank" '
-                         f'style="color:#4b5563;text-decoration:none;font-size:10px;display:block;margin-bottom:2px">'
-                         f'↗ {label}</a>')
-        return "".join(links) if links else '<span style="color:#9ca3af;font-size:10px">—</span>'
-
-    rows = ""
-    for i, f in enumerate(findings, 1):
-        sev = f.get("severity", "low")
-        color = severity_colors.get(sev, "#6b7280")
+    def _card(idx: int, f: dict) -> str:
         pt = f.get("pattern_type", "")
-        label = pattern_labels.get(pt, pt)
+        canonical = _PATTERN_ALIASES.get(pt, pt)
+        meta = _PATTERN_META.get(canonical, {})
+        sev = f.get("severity", "low")
+        pal = SEV_PALETTE.get(sev, SEV_PALETTE["low"])
+        icon = meta.get("icon", "⚠")
+        title = meta.get("title", pt)
 
-        facts = []
-        if f.get("official_name"): facts.append(f"Funkcioner: <strong>{f['official_name']}</strong>")
-        if f.get("institution"): facts.append(f"Institucija: {f['institution']}")
-        if f.get("family_member"): facts.append(f"Porodica: <strong>{f['family_member']}</strong>")
-        if f.get("company_name"): facts.append(f"Firma: <strong>{f['company_name']}</strong>")
-        if f.get("winner"): facts.append(f"Pobednik: <strong>{f['winner']}</strong>")
-        if f.get("contract_title"): facts.append(f"Ugovor: {f['contract_title']}")
-        if f.get("person_name") and not f.get("official_name"): facts.append(f"Osoba: <strong>{f['person_name']}</strong>")
-        if f.get("party_name"): facts.append(f"Stranka: {f['party_name']}")
-        if f.get("donor_company"): facts.append(f"Donator: <strong>{f['donor_company']}</strong>")
-        if f.get("address"): facts.append(f"Adresa: {f['address']} ({f.get('num_companies','?')} firmi)")
-        if f.get("name_1"): facts.append(f"Osoba 1: {f['name_1']} ({f.get('institution_1','')})")
-        if f.get("name_2"): facts.append(f"Osoba 2: {f['name_2']} ({f.get('institution_2','')})")
+        # ── Evidence fields ──────────────────────────────────────────
+        ev_rows = ""
+        monetary_keys = {"value", "amount", "total_value", "total", "contract_value",
+                         "value_rsd", "donation_amount", "total_contract_value",
+                         "company_total_value", "institution_total_value"}
+        for key, label in meta.get("fields", []):
+            val = f.get(key)
+            if val is None or val == "":
+                continue
+            is_mon = any(mk in key for mk in monetary_keys)
+            is_pct = "pct" in key
+            if is_mon:
+                display = f'<span style="color:#b45309;font-weight:700;font-family:monospace">{_fmt_rsd(val)}</span>'
+            elif is_pct:
+                try:
+                    display = f'<span style="color:#b45309;font-weight:700">{float(val):.0f}%</span>'
+                except Exception:
+                    display = f'<span style="color:#374151">{_esc(str(val))}</span>'
+            else:
+                display = f'<span style="color:#1e293b">{_esc(str(val))}</span>'
+            ev_rows += (
+                f'<tr>'
+                f'<td style="padding:5px 14px 5px 0;font-size:11px;color:#64748b;white-space:nowrap;'
+                f'font-family:monospace;vertical-align:top;min-width:160px">{_esc(label)}</td>'
+                f'<td style="padding:5px 0;font-size:12.5px;font-weight:500;word-break:break-word">{display}</td>'
+                f'</tr>'
+            )
+        evidence_html = ""
+        if ev_rows:
+            evidence_html = (
+                '<div class="section">'
+                '<div class="stitle">🔍 Detektovani entiteti</div>'
+                f'<table style="border-collapse:collapse;width:100%">{ev_rows}</table>'
+                '</div>'
+            )
 
-        val = f.get("contract_value") or f.get("value_rsd") or f.get("total_value") or f.get("donation_amount")
-        if val:
-            val_m = val / 1_000_000
-            facts.append(f"Vrednost: <strong>{val_m:.1f}M RSD</strong>")
-        if f.get("award_date"): facts.append(f"Datum: {f['award_date']}")
+        # ── Why suspicious ───────────────────────────────────────────
+        why_html = ""
+        why_text = meta.get("why", "")
+        if why_text:
+            lines = why_text.split("\n")
+            inner = ""
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("•"):
+                    inner += f'<div style="padding:3px 0 3px 16px;color:#374151;line-height:1.65">{_esc(stripped)}</div>'
+                else:
+                    inner += f'<p style="margin:0 0 7px;line-height:1.7;color:#1e293b">{_esc(stripped)}</p>'
+            why_html = (
+                '<div class="section">'
+                '<div class="stitle">⚠ Zašto je sumnjivo</div>'
+                f'<div style="font-size:12.5px;background:#fffbeb;border-left:3px solid {pal["border"]};'
+                f'padding:12px 16px;border-radius:0 6px 6px 0;line-height:1.7">{inner}</div>'
+                '</div>'
+            )
 
-        facts_html = "".join(f'<div style="padding:2px 0;color:#374151;font-size:12px">{fact}</div>' for fact in facts)
-        source_html = _portals_html(pt, f)
+        # ── How detected (graph path) ────────────────────────────────
+        how_html = ""
+        how_text = meta.get("how", "")
+        if how_text:
+            how_html = (
+                '<div class="section">'
+                '<div class="stitle">◎ Kako je detektovano (put u grafu)</div>'
+                f'<pre style="font-size:10.5px;font-family:monospace;color:#1e40af;background:#eff6ff;'
+                f'padding:12px 16px;border-radius:6px;border:1px solid #bfdbfe;margin:0;'
+                f'white-space:pre-wrap;word-break:break-word;line-height:1.7">{_esc(how_text)}</pre>'
+                '</div>'
+            )
 
-        rows += f"""
-        <tr style="border-bottom:1px solid #e5e7eb">
-          <td style="padding:10px 8px;color:#6b7280;font-size:12px;white-space:nowrap;vertical-align:top">{i}</td>
-          <td style="padding:10px 8px;vertical-align:top">
-            <span style="background:{color}22;color:{color};border:1px solid {color};padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;white-space:nowrap">{sev}</span>
-          </td>
-          <td style="padding:10px 8px;font-weight:700;font-size:13px;color:#111827;vertical-align:top;white-space:nowrap">{label}</td>
-          <td style="padding:10px 8px;vertical-align:top">{facts_html}</td>
-          <td style="padding:10px 8px;vertical-align:top;min-width:200px">{source_html}</td>
-        </tr>"""
+        # ── Contract details ─────────────────────────────────────────
+        det_rows = ""
+        proc_type = str(f.get("proc_type") or "")
+        if proc_type:
+            pt_label = _PROC_TYPE_LABELS.get(proc_type, f"Tip {proc_type}")
+            det_rows += (
+                f'<tr><td style="padding:4px 14px 4px 0;font-size:11px;color:#64748b;white-space:nowrap;'
+                f'font-family:monospace;vertical-align:top">Vrsta postupka</td>'
+                f'<td style="padding:4px 0;font-size:11px;color:#374151">{_esc(pt_label)}</td></tr>'
+            )
+        award_date = f.get("award_date") or ""
+        if award_date:
+            det_rows += (
+                f'<tr><td style="padding:4px 14px 4px 0;font-size:11px;color:#64748b;white-space:nowrap;'
+                f'font-family:monospace;vertical-align:top">Datum dodele ugovora</td>'
+                f'<td style="padding:4px 0;font-size:11px;color:#374151">{_esc(str(award_date))}</td></tr>'
+            )
+        contract_id = f.get("contract_id") or ""
+        if contract_id:
+            det_rows += (
+                f'<tr><td style="padding:4px 14px 4px 0;font-size:11px;color:#64748b;white-space:nowrap;'
+                f'font-family:monospace;vertical-align:top">ID ugovora</td>'
+                f'<td style="padding:4px 0;font-size:11px;color:#374151;font-family:monospace">{_esc(str(contract_id))}</td></tr>'
+            )
+        contracts_detail = f.get("contracts_detail") or []
+        if contracts_detail and isinstance(contracts_detail, list):
+            for cd in contracts_detail[:5]:
+                if not isinstance(cd, dict):
+                    continue
+                cd_title = _esc(str(cd.get("title") or cd.get("t") or "")[:80])
+                cd_val = cd.get("value") or cd.get("v")
+                cd_date = cd.get("date") or cd.get("d") or ""
+                cd_id = cd.get("id") or ""
+                val_str = _fmt_rsd(cd_val) if cd_val else "—"
+                det_rows += (
+                    f'<tr><td colspan="2" style="padding:5px 0;font-size:10.5px;color:#475569;'
+                    f'border-top:1px solid #f1f5f9">'
+                    f'<span style="font-family:monospace;color:#64748b">&rsaquo;</span> '
+                    f'{cd_title or "(bez naziva)"} &nbsp;'
+                    f'<span style="color:#b45309;font-weight:700;font-family:monospace">{val_str}</span>'
+                    f'{f" &nbsp; {_esc(str(cd_date))}" if cd_date else ""}'
+                    f'</td></tr>'
+                )
+        contract_detail_html = ""
+        if det_rows:
+            contract_detail_html = (
+                '<div class="section">'
+                '<div class="stitle">📋 Detalji ugovora / nabavke</div>'
+                f'<table style="border-collapse:collapse;width:100%">{det_rows}</table>'
+                '<div style="margin-top:8px;font-size:10px;color:#94a3b8;font-style:italic">'
+                'Napomena: datum potpisivanja, identitet potpisnika i kompletna dokumentacija '
+                'dostupni su na portalu javnih nabavki (link ispod).'
+                '</div>'
+                '</div>'
+            )
 
-    risk_color = severity_colors.get(risk.get("risk_level", "low"), "#6b7280")
+        # ── Sources & verification ───────────────────────────────────
+        src_items = ""
+        for lbl, url in meta.get("sources", []):
+            src_items += (
+                f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+                f'style="display:flex;align-items:center;gap:8px;padding:7px 12px;'
+                f'background:#f0f9ff;border-radius:5px;text-decoration:none;'
+                f'color:#0369a1;font-size:11px;margin-bottom:5px;border:1px solid #bae6fd">'
+                f'<span style="font-size:10px">↗</span>{_esc(lbl)}</a>'
+            )
+        vurl = str(f.get("verification_url") or "")
+        if vurl.startswith("http"):
+            src_items += (
+                f'<a href="{vurl}" target="_blank" rel="noopener noreferrer" '
+                f'style="display:flex;align-items:center;gap:8px;padding:7px 12px;'
+                f'background:#f0fdf4;border-radius:5px;text-decoration:none;'
+                f'color:#15803d;font-size:11px;margin-bottom:5px;border:1px solid #bbf7d0">'
+                f'<span style="font-size:10px">⊕</span>Direktni link na ugovor / nabavku (JN Portal)</a>'
+            )
+        mb = str(f.get("company_mb") or f.get("winner_mb") or "")
+        if mb and not mb.upper().startswith("MB-SEED"):
+            apr_url = f"https://pretraga.apr.gov.rs/unifiedsearch?searchTerm={mb}"
+            src_items += (
+                f'<a href="{apr_url}" target="_blank" rel="noopener noreferrer" '
+                f'style="display:flex;align-items:center;gap:8px;padding:7px 12px;'
+                f'background:#faf5ff;border-radius:5px;text-decoration:none;'
+                f'color:#7e22ce;font-size:11px;margin-bottom:5px;border:1px solid #e9d5ff">'
+                f'<span style="font-size:10px">↗</span>APR pretraga firme: {_esc(mb)}</a>'
+            )
+        sources_html = ""
+        if src_items:
+            sources_html = (
+                '<div class="section">'
+                '<div class="stitle">◈ Korišćeni izvori i verifikacija</div>'
+                f'{src_items}'
+                '</div>'
+            )
+
+        return (
+            f'<div class="card" style="border-top:4px solid {pal["border"]};background:{pal["bg"]}">'
+            f'<div class="card-hdr">'
+            f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+            f'<span style="font-size:28px;line-height:1">{icon}</span>'
+            f'<div>'
+            f'<div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:4px">{_esc(title)}</div>'
+            f'<span style="font-size:10px;padding:2px 10px;border-radius:4px;font-weight:700;'
+            f'text-transform:uppercase;letter-spacing:0.06em;'
+            f'background:{pal["badge"]};color:{pal["text"]};border:1px solid {pal["border"]}">'
+            f'{sev}</span>'
+            f'</div>'
+            f'<div style="margin-left:auto;font-size:11px;color:#94a3b8;font-family:monospace">#{idx}</div>'
+            f'</div>'
+            f'</div>'
+            f'<div class="card-body">'
+            f'{evidence_html}'
+            f'{why_html}'
+            f'{how_html}'
+            f'{contract_detail_html}'
+            f'{sources_html}'
+            f'</div>'
+            f'</div>'
+        )
+
+    cards_html = "\n".join(_card(i, f) for i, f in enumerate(sorted_findings, 1))
+
+    risk_color = {"critical": "#dc2626", "high": "#f97316", "medium": "#ca8a04", "low": "#6b7280"}.get(
+        risk.get("risk_level", "low"), "#6b7280"
+    )
     sc = risk.get("severity_counts", {})
+    ts = datetime.utcnow().strftime("%d.%m.%Y. u %H:%M UTC")
+    data_note = (
+        "Samo stvarni podaci — sintetički test-podaci su isključeni iz ovog izveštaja."
+        if exclude_seed
+        else "Uključeni su svi podaci (i test-podaci). Za izveštaj samo sa stvarnim podacima, "
+             "otvorite URL sa <code>&amp;exclude_seed=true</code>."
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="sr">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Srpska Transparentnost — Izveštaj o nalazima</title>
 <style>
-  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 32px; background: #f9fafb; color: #111827; }}
-  .header {{ background: linear-gradient(135deg, #0f172a, #1e293b); color: white; padding: 28px 32px; border-radius: 12px; margin-bottom: 28px; }}
-  .header h1 {{ margin: 0 0 6px; font-size: 22px; }}
-  .header p {{ margin: 0; color: #94a3b8; font-size: 13px; }}
-  .notice {{ background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:12px;color:#92400e; }}
-  .stats {{ display: flex; gap: 16px; margin-bottom: 28px; flex-wrap: wrap; }}
-  .stat {{ background: white; border-radius: 8px; padding: 16px 20px; border: 1px solid #e5e7eb; flex: 1; min-width: 120px; }}
-  .stat .val {{ font-size: 28px; font-weight: 700; }}
-  .stat .lbl {{ font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }}
-  table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
-  th {{ background: #f1f5f9; padding: 10px 8px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; border-bottom: 2px solid #e2e8f0; }}
-  .sources-footer {{ margin-top:28px; background:white; border-radius:8px; border:1px solid #e5e7eb; padding:20px 24px; }}
-  .sources-footer h3 {{ margin:0 0 14px; font-size:13px; color:#374151; }}
-  .src-row {{ display:flex; gap:12px; margin-bottom:8px; align-items:baseline; }}
-  .src-name {{ font-size:12px; font-weight:600; color:#111827; min-width:220px; }}
-  .src-url {{ font-size:11px; color:#2563eb; text-decoration:none; }}
-  @media print {{ body {{ padding: 16px; }} .no-print {{ display: none; }} }}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',Arial,sans-serif;background:#f1f5f9;color:#1e293b;padding:24px 32px}}
+  .header{{background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);color:white;padding:28px 32px;border-radius:12px;margin-bottom:22px}}
+  .header h1{{font-size:22px;font-weight:700;margin-bottom:6px}}
+  .header p{{font-size:12px;color:#94a3b8;margin-top:4px}}
+  .notice{{background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:12px 16px;margin-bottom:18px;font-size:12px;color:#92400e;line-height:1.6}}
+  .stats{{display:flex;gap:12px;margin-bottom:22px;flex-wrap:wrap}}
+  .stat{{background:white;border-radius:8px;padding:14px 18px;border:1px solid #e2e8f0;flex:1;min-width:90px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
+  .stat .val{{font-size:26px;font-weight:700}}
+  .stat .lbl{{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-top:4px}}
+  .card{{background:white;border-radius:10px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08);overflow:hidden}}
+  .card-hdr{{padding:16px 20px 14px;border-bottom:1px solid #e2e8f0}}
+  .card-body{{padding:20px;display:flex;flex-direction:column;gap:16px}}
+  .section{{display:flex;flex-direction:column;gap:6px}}
+  .stitle{{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#64748b;font-weight:700;font-family:monospace;margin-bottom:2px}}
+  .sfooter{{background:white;border-radius:10px;padding:20px 24px;margin-top:22px;border:1px solid #e2e8f0}}
+  .sfooter h3{{font-size:12px;color:#374151;margin-bottom:12px;text-transform:uppercase;letter-spacing:.06em}}
+  .src-row{{display:flex;gap:12px;margin-bottom:6px;align-items:center}}
+  .src-name{{font-size:12px;font-weight:500;min-width:260px}}
+  .src-url{{font-size:11px;color:#2563eb;text-decoration:none}}
+  .btn{{background:#0f172a;color:white;border:none;border-radius:6px;padding:9px 22px;cursor:pointer;font-size:13px;margin-bottom:18px;display:inline-block}}
+  @media print{{body{{padding:8px;background:white}}.no-print{{display:none!important}}.card{{break-inside:avoid;box-shadow:none;border:1px solid #e2e8f0}}.header{{background:#0f172a!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>Srpska Transparentnost — Izveštaj o nalazima</h1>
-  <p>Generisano: {datetime.utcnow().strftime('%d.%m.%Y. u %H:%M UTC')} &nbsp;|&nbsp; Ukupno nalaza: {len(findings)}</p>
+  <h1>🔍 Srpska Transparentnost — Analiza korupcije u javnim nabavkama</h1>
+  <p>Generisano: {ts}</p>
+  <p style="margin-top:8px;color:#e2e8f0;font-size:13px">Automatska detekcija obrazaca korupcije na osnovu javno dostupnih podataka</p>
 </div>
 <div class="notice">
-  <strong>Napomena o podacima:</strong> Ovaj izveštaj se zasniva na podacima koji su trenutno u bazi.
-  Ako baza sadrži sintetičke test-podatke (source='seed'), linkovi u koloni "Izvor" vode ka pravim državnim portalima
-  gde možete ručno proveriti informacije — ali konkretni entiteti (firme, lica) su izmišljeni i neće biti nađeni.
-  Za pravi nalaz pokrenite <code>POST /ingest/all</code> da biste skupili stvarne podatke.
+  <strong>Napomena:</strong> {data_note}<br>
+  Svi nalazi su zasnovani na javno dostupnim podacima. Detekcija <strong>ne znači automatski dokazanu korupciju</strong> —
+  svaki nalaz zahteva dalju reviziju i proveru na navedenim izvorima podataka.
+  Potpisnici ugovora, datum objave tendera i kompletna dokumentacija dostupni su direktno na JN portalu.
 </div>
 <div class="stats">
   <div class="stat"><div class="val" style="color:{risk_color}">{len(findings)}</div><div class="lbl">Ukupno nalaza</div></div>
   <div class="stat"><div class="val" style="color:#dc2626">{sc.get('critical',0)}</div><div class="lbl">Kritičnih</div></div>
   <div class="stat"><div class="val" style="color:#f97316">{sc.get('high',0)}</div><div class="lbl">Visokih</div></div>
-  <div class="stat"><div class="val" style="color:#eab308">{sc.get('medium',0)}</div><div class="lbl">Srednje</div></div>
+  <div class="stat"><div class="val" style="color:#ca8a04">{sc.get('medium',0)}</div><div class="lbl">Srednje</div></div>
   <div class="stat"><div class="val" style="color:{risk_color}">{risk.get('risk_score',0)}</div><div class="lbl">Risk score</div></div>
 </div>
-<button class="no-print" onclick="window.print()" style="margin-bottom:20px;padding:8px 20px;background:#0f172a;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Štampaj / Sačuvaj PDF</button>
-<table>
-  <thead><tr><th>#</th><th>Nivo</th><th>Obrazac</th><th>Detalji</th><th>Gde proveriti (izvor)</th></tr></thead>
-  <tbody>{rows}</tbody>
-</table>
-<div class="sources-footer">
+<button class="btn no-print" onclick="window.print()">🖨 Štampaj / Sačuvaj PDF</button>
+<div style="font-size:11px;color:#64748b;margin-bottom:16px">Nalazi sortirani po ozbiljnosti (kritični prvi)</div>
+{cards_html}
+<div class="sfooter no-print">
   <h3>Registrovani izvori podataka</h3>
   <div class="src-row"><span class="src-name">APR — Agencija za privredne registre</span><a class="src-url" href="https://pretraga.apr.gov.rs" target="_blank">pretraga.apr.gov.rs</a></div>
-  <div class="src-row"><span class="src-name">Portal javnih nabavki — UJN</span><a class="src-url" href="https://jnportal.ujn.gov.rs/tender-documents/search" target="_blank">jnportal.ujn.gov.rs</a></div>
+  <div class="src-row"><span class="src-name">Portal javnih nabavki (JN Portal) — UJN</span><a class="src-url" href="https://jnportal.ujn.gov.rs/tender-documents/search" target="_blank">jnportal.ujn.gov.rs</a></div>
   <div class="src-row"><span class="src-name">Otvoreni podaci — data.gov.rs</span><a class="src-url" href="https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/" target="_blank">data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici</a></div>
   <div class="src-row"><span class="src-name">ACAS — Finansiranje stranaka</span><a class="src-url" href="https://www.acas.rs/finansiranje-politickih-subjekata/" target="_blank">acas.rs/finansiranje-politickih-subjekata</a></div>
   <div class="src-row"><span class="src-name">ACAS — Imovinski registar</span><a class="src-url" href="https://www.acas.rs/imovinski-registar/" target="_blank">acas.rs/imovinski-registar</a></div>
