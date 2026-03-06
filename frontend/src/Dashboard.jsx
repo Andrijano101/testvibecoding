@@ -716,7 +716,7 @@ function ForceGraph({ nodes, edges, onNodeClick, highlightIds }) {
 }
 
 // ── Entity Browser Panel ────────────────────────────────────────
-function EntityBrowser({ type, label, color, onClose, onSelectEntity }) {
+function EntityBrowser({ type, label, color, onClose, onSelectEntity, excludeSeed = false }) {
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [q, setQ] = useState("");
@@ -726,11 +726,16 @@ function EntityBrowser({ type, label, color, onClose, onSelectEntity }) {
 
   const load = useCallback(async (query = "") => {
     setLoading(true);
-    const url = `/entities?type=${type}&limit=100${query ? `&q=${encodeURIComponent(query)}` : ""}`;
+    const url = `/entities?type=${type}&limit=100${query ? `&q=${encodeURIComponent(query)}` : ""}${excludeSeed ? "&exclude_seed=true" : ""}`;
     const d = await apiFetch(url);
-    if (d) { setItems(d.items || []); setTotal(d.total || 0); }
+    if (d) {
+      const rawItems = d.items || [];
+      const filtered = excludeSeed ? rawItems.filter(it => it.props?.source !== 'seed') : rawItems;
+      setItems(filtered);
+      setTotal(excludeSeed ? filtered.length : (d.total || 0));
+    }
     setLoading(false);
-  }, [type]);
+  }, [type, excludeSeed]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -1103,6 +1108,7 @@ export default function Dashboard() {
           label={entityBrowser.label}
           color={entityBrowser.color}
           onClose={() => setEntityBrowser(null)}
+          excludeSeed={!showTestData}
           onSelectEntity={(id, type, name) => {
             exploreEntity(id, type);
           }}
@@ -1236,7 +1242,7 @@ export default function Dashboard() {
                   {!isDemo && realNodeCount > 0 && (
                     <span style={{ fontSize: 7, color: "#10b981", background: "#10b98115", padding: "1px 4px", borderRadius: 3, fontWeight: 700, border: "1px solid #10b98133" }}>◉ REAL</span>
                   )}
-                  {!isDemo && testNodeCount > 0 && (
+                  {!isDemo && testNodeCount > 0 && showTestData && (
                     <span style={{ fontSize: 7, color: "#f59e0b", background: "#f59e0b15", padding: "1px 4px", borderRadius: 3, fontWeight: 700, border: "1px solid #f59e0b33" }}>◌ TEST</span>
                   )}
                   {!isDemo && flaggedCounts != null && (
@@ -1381,7 +1387,7 @@ export default function Dashboard() {
                         { label: "HTML izveštaj", format: "html", title: "Otvori printabilni izveštaj" },
                       ].map(({ label, format, title }) => (
                         <a key={format}
-                          href={`${API_BASE}/export/findings?format=${format}`}
+                          href={`${API_BASE}/export/findings?format=${format}${!showTestData ? "&exclude_seed=true" : ""}`}
                           target={format === "html" ? "_blank" : "_self"}
                           download={format !== "html" ? undefined : undefined}
                           rel="noopener noreferrer"
@@ -1517,7 +1523,7 @@ export default function Dashboard() {
                   Registrovani izvori podataka
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 28 }}>
-                  {SOURCE_REGISTRY.map((src, i) => {
+                  {SOURCE_REGISTRY.filter(src => showTestData || src.key !== "seed").map((src, i) => {
                     const nodeCount = sourceCounts[src.key] ?? 0;
                     const hasData = nodeCount > 0;
                     return (
@@ -1604,8 +1610,8 @@ export default function Dashboard() {
                 {realNodeCount > 0 && (
                   <span style={{ color: "#10b981" }}>◉ {realNodeCount} realni</span>
                 )}
-                {realNodeCount > 0 && testNodeCount > 0 && <span>+</span>}
-                {testNodeCount > 0 && (
+                {realNodeCount > 0 && testNodeCount > 0 && showTestData && <span>+</span>}
+                {testNodeCount > 0 && showTestData && (
                   <span style={{ color: "#f59e0b" }}>◌ {testNodeCount} test</span>
                 )}
                 {nodes.length > 0 && <><span>·</span><span>{edges.length} veza</span></>}
