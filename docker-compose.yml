@@ -46,8 +46,10 @@ services:
       - PROCUREMENT_YEARS=${PROCUREMENT_YEARS:-last:3}
       - PROCUREMENT_MAX_ROWS=${PROCUREMENT_MAX_ROWS:-5000}
       # JN Portal live contract scraper
-      - JNPORTAL_MAX_ROWS=${JNPORTAL_MAX_ROWS:-5000}
-      - JNPORTAL_MIN_VALUE=${JNPORTAL_MIN_VALUE:-1000000}
+      # 20K rows: 10K by value, 5K recent, 5K non-competitive (proc_type 3/9)
+      - JNPORTAL_MAX_ROWS=${JNPORTAL_MAX_ROWS:-20000}
+      # Lower to 500K to capture threshold-manipulation zone (850K-3M RSD)
+      - JNPORTAL_MIN_VALUE=${JNPORTAL_MIN_VALUE:-500000}
       - JNPORTAL_PAGE_SIZE=${JNPORTAL_PAGE_SIZE:-100}
       # APR company director enrichment (companywall.rs)
       - CW_MAX_COMPANIES=${CW_MAX_COMPANIES:-500}

@@ -266,7 +266,9 @@ class JNPortalScraper:
 
         while len(contracts) < max_rows and total_scanned < MAX_SCAN:
             try:
-                page = self._fetch_page(skip, page_size, sort_field="TotalValue")
+                # Scan by date (most recent first) — non-competitive contracts
+                # are distributed across all years, recent ones are most relevant
+                page = self._fetch_page(skip, page_size, sort_field="ContractDate")
             except Exception as e:
                 logger.error("jnportal_page_failed", skip=skip, error=str(e))
                 break

@@ -966,8 +966,9 @@ def _run_scrape(source: str, since_days: int = 7, years: str = None, force_refre
         if source in ("jnportal", "all"):
             from backend.scrapers.jnportal_scraper import JNPortalScraper
             s = JNPortalScraper()
-            max_rows = int(os.getenv("JNPORTAL_MAX_ROWS", "2000"))
-            s.scrape(max_rows=max_rows, force_refresh=force_refresh)
+            max_rows = int(os.getenv("JNPORTAL_MAX_ROWS", "20000"))
+            min_value = float(os.getenv("JNPORTAL_MIN_VALUE", "500000"))
+            s.scrape(max_rows=max_rows, min_value=min_value, force_refresh=force_refresh)
             s.client.close()
             logger.info("scrape_done", source="jnportal")
 
