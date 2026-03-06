@@ -43,6 +43,8 @@ class GraphLoader:
         self.load_ujn_procurements()
         self.load_jnportal_data()
         self.load_parties()
+        self.load_op_data()
+        self.load_vlada_data()
         self.deduplicate_institutions()
         self.resolver.save(RESOLVER_STATE)
         logger.info("graph_load_complete", stats=self.resolver.stats())
@@ -308,6 +310,76 @@ class GraphLoader:
         # Try to merge any existing stubs (from previous loads) to real nodes
         self._merge_op_stubs()
         logger.info("op_load_done", loaded=loaded, linked_companies=linked_companies)
+
+    def load_vlada_data(self):
+        """Load Serbian government cabinet members from data/raw/vlada/cabinet.json.
+
+        Creates Person nodes for ministers + EMPLOYED_BY → their ministry Institution.
+        Also creates the Institution nodes for each ministry if they don't exist.
+        """
+        vlada_file = os.path.join(DATA_DIR, "raw", "vlada", "cabinet.json")
+        if not os.path.exists(vlada_file):
+            logger.info("vlada_load_skip", reason="no_file")
+            return
+
+        with open(vlada_file, encoding="utf-8") as f:
+            members = json.load(f)
+
+        logger.info("vlada_load_start", count=len(members))
+        loaded = 0
+
+        for member in members:
+            name = member.get("full_name", "").strip()
+            if not name or len(name) < 3:
+                continue
+
+            resolved = self.resolver.resolve_person(name, source="vlada")
+            pid = resolved.canonical_id
+
+            # Upsert Person node
+            run_query("""
+                MERGE (p:Person {person_id: $pid})
+                SET p.full_name       = $name,
+                    p.name_normalized = $name_norm,
+                    p.current_role    = $role,
+                    p.party_abbr      = $party,
+                    p.source          = 'vlada',
+                    p.updated_at      = $now
+            """, {
+                "pid": pid,
+                "name": name,
+                "name_norm": member.get("name_normalized", ""),
+                "role": member.get("role", ""),
+                "party": member.get("party_abbr", ""),
+                "now": datetime.utcnow().isoformat(),
+            })
+
+            # Upsert Institution node for their ministry
+            inst_id = member.get("institution_id", "")
+            inst_name = member.get("institution_name", "")
+            if inst_id and inst_name:
+                run_query("""
+                    MERGE (i:Institution {institution_id: $iid})
+                    SET i.name   = $iname,
+                        i.source = 'vlada'
+                """, {"iid": inst_id, "iname": inst_name})
+
+                # EMPLOYED_BY relationship
+                run_query("""
+                    MATCH (p:Person {person_id: $pid})
+                    MATCH (i:Institution {institution_id: $iid})
+                    MERGE (p)-[r:EMPLOYED_BY]->(i)
+                    SET r.role   = $role,
+                        r.source = 'vlada'
+                """, {
+                    "pid": pid,
+                    "iid": inst_id,
+                    "role": member.get("role", "Ministar"),
+                })
+
+            loaded += 1
+
+        logger.info("vlada_load_done", loaded=loaded)
 
     def deduplicate_institutions(self):
         """Merge duplicate Institution nodes that share the same PIB.

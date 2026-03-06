@@ -900,6 +900,13 @@ def _run_scrape(source: str, since_days: int = 7, years: str = None, force_refre
             s.close()
             logger.info("scrape_done", source="op")
 
+        if source in ("vlada", "all"):
+            from backend.scrapers.vlada_scraper import VladaScraper
+            s = VladaScraper()
+            s.scrape(force_refresh=force_refresh)
+            s.close()
+            logger.info("scrape_done", source="vlada")
+
     except Exception as e:
         logger.error("scrape_failed", source=source, error=str(e))
 
@@ -931,6 +938,8 @@ def _run_load(source: str):
             loader.load_companywall_data()
         elif source in ("op", "otvoreni_parlament"):
             loader.load_op_data()
+        elif source == "vlada":
+            loader.load_vlada_data()
         else:
             loader.load_all()
     finally:
@@ -974,7 +983,7 @@ def load_source(source: str):
     Load scraped data for a specific source into Neo4j.
     source: apr | companywall | procurement | rik | gazette | rgz | opendata | deduplicate
     """
-    valid = {"apr", "companywall", "procurement", "rik", "gazette", "rgz", "opendata", "ujn", "jnportal", "deduplicate"}
+    valid = {"apr", "companywall", "procurement", "rik", "gazette", "rgz", "opendata", "ujn", "jnportal", "deduplicate", "op", "otvoreni_parlament", "vlada"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
     if source == "deduplicate":
@@ -1020,7 +1029,7 @@ def ingest_source(
     For 'all': scrapes all sources then loads everything into Neo4j.
     This is the recommended way to populate with real data.
     """
-    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "companywall", "apr", "op", "otvoreni_parlament", "all"}
+    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "companywall", "apr", "op", "otvoreni_parlament", "vlada", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
 
