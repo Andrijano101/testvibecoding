@@ -43,8 +43,327 @@ class GraphLoader:
         self.load_ujn_procurements()
         self.load_jnportal_data()
         self.load_parties()
+        self.deduplicate_institutions()
         self.resolver.save(RESOLVER_STATE)
         logger.info("graph_load_complete", stats=self.resolver.stats())
+
+    def load_companywall_data(self):
+        """Load APR + RGZ data scraped from companywall.rs."""
+        self.load_apr_data()   # APR JSON files include companywall records
+        self.load_rgz_data()   # RGZ JSON files include companywall property records
+
+    @staticmethod
+    def _op_company_keywords(company_name: str) -> list:
+        """Extract distinctive search keywords from a company name.
+
+        Strips legal form prefixes/suffixes and city names so that
+        'JP Srbijagas Novi Sad' yields ['srbijagas'] which will match
+        'JAVNO PREDUZEĆE SRBIJAGAS NOVI SAD'.
+        """
+        import re
+        try:
+            from unidecode import unidecode
+            name_lower = unidecode(company_name.lower())
+        except Exception:
+            name_lower = company_name.lower()
+
+        NOISE = {
+            "doo", "d.o.o", "d.o.o.", "ad", "a.d.", "jp", "j.p.", "kd", "od",
+            "ltd", "llc", "gmbh", "javno", "preduzece", "preduzeće", "privredno",
+            "drustvo", "drustvo", "akcionarsko", "ortacko", "komanditno",
+            "beograd", "novi", "sad", "nis", "nish", "srbija", "srbije",
+            "grupa", "group", "holding", "centar", "centar", "sistem",
+            "usluge", "trade", "inzenjering", "inzeniring", "commerce",
+        }
+        name_clean = re.sub(r'[.,\-\(\)\/\\"]', ' ', name_lower)
+        words = name_clean.split()
+        return [w for w in words if len(w) >= 5 and w not in NOISE]
+
+    def _find_real_companies(self, co_name: str, co_norm: str) -> list:
+        """Return list of maticni_broj for existing non-stub Company nodes matching co_name."""
+        found = set()
+
+        # 1. Exact normalized match
+        matches = run_query("""
+            MATCH (co:Company)
+            WHERE co.name_normalized = $norm
+              AND NOT co.maticni_broj STARTS WITH 'CO-OP-'
+            RETURN co.maticni_broj AS mb
+            LIMIT 5
+        """, {"norm": co_norm})
+        for r in matches:
+            if r.get("mb"):
+                found.add(r["mb"])
+
+        if found:
+            return list(found)
+
+        # 2. Keyword match — any keyword that appears in the real company name
+        keywords = self._op_company_keywords(co_name)
+        for kw in keywords:
+            kw_matches = run_query("""
+                MATCH (co:Company)
+                WHERE NOT co.maticni_broj STARTS WITH 'CO-OP-'
+                  AND (toLower(co.name) CONTAINS $kw
+                       OR toLower(coalesce(co.name_normalized, '')) CONTAINS $kw)
+                RETURN co.maticni_broj AS mb
+                LIMIT 10
+            """, {"kw": kw})
+            for r in kw_matches:
+                if r.get("mb"):
+                    found.add(r["mb"])
+
+        return list(found)
+
+    def _merge_op_stubs(self):
+        """Try to link existing CO-OP-* stub nodes to real Company nodes.
+
+        After improving the keyword matcher, re-run this to pick up any stubs
+        that were created before the better matching was in place.
+        """
+        stubs = run_query("""
+            MATCH (p:Person)-[r:DIRECTS]->(stub:Company)
+            WHERE stub.maticni_broj STARTS WITH 'CO-OP-'
+            RETURN p.person_id AS pid, stub.maticni_broj AS stub_mb,
+                   stub.name AS stub_name, stub.name_normalized AS stub_norm,
+                   r.role AS role, r.income_rsd AS income
+        """)
+        merged = 0
+        for row in stubs:
+            stub_mb = row.get("stub_mb")
+            stub_name = row.get("stub_name", "")
+            stub_norm = row.get("stub_norm", "")
+            pid = row.get("pid")
+            if not stub_mb or not stub_name:
+                continue
+            real_mbs = self._find_real_companies(stub_name, stub_norm)
+            if not real_mbs:
+                continue
+            for real_mb in real_mbs:
+                run_query("""
+                    MATCH (p:Person {person_id: $pid})-[r:DIRECTS]->(stub:Company {maticni_broj: $stub_mb})
+                    MATCH (real:Company {maticni_broj: $real_mb})
+                    MERGE (p)-[r2:DIRECTS]->(real)
+                    SET r2.role       = $role,
+                        r2.source     = 'op',
+                        r2.income_rsd = $income
+                    DELETE r
+                """, {
+                    "pid": pid,
+                    "stub_mb": stub_mb,
+                    "real_mb": real_mb,
+                    "role": row.get("role", "Direktor"),
+                    "income": row.get("income"),
+                })
+            # Delete stub if it has no remaining relationships
+            run_query("""
+                MATCH (stub:Company {maticni_broj: $stub_mb})
+                WHERE NOT (stub)--()
+                DELETE stub
+            """, {"stub_mb": stub_mb})
+            logger.info("op_stub_merged", stub=stub_name, real_mbs=real_mbs)
+            merged += 1
+        logger.info("op_merge_stubs_done", merged=merged)
+
+    def load_op_data(self):
+        """Load Otvoreni Parlament MP profiles from data/raw/op/.
+
+        Each JSON file is one MP with:
+          - full_name, party_name, party_abbr, club, birth_date, city, profession
+          - company_roles: [{role, company_name, company_name_normalized, income_rsd, period_start}]
+
+        Creates/enriches Person nodes and DIRECTS relationships to named companies.
+        Also attempts to match company names to existing Company nodes in the graph.
+        """
+        op_dir = os.path.join(DATA_DIR, "raw", "op")
+        files = glob.glob(os.path.join(op_dir, "*.json"))
+        logger.info("op_load_start", files=len(files))
+        loaded = 0
+        linked_companies = 0
+
+        for path in files:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    record = json.load(f)
+
+                name = record.get("full_name", "").strip()
+                if not name or len(name) < 3:
+                    continue
+
+                op_id = record.get("op_id", "")
+                resolved = self.resolver.resolve_person(name, source="op")
+                pid = resolved.canonical_id
+
+                # Upsert Person node
+                run_query("""
+                    MERGE (p:Person {person_id: $pid})
+                    SET p.full_name       = $name,
+                        p.name_normalized = $name_norm,
+                        p.current_role    = $role,
+                        p.party_name      = $party,
+                        p.party_abbr      = $abbr,
+                        p.birth_date      = $bdate,
+                        p.city            = $city,
+                        p.profession      = $prof,
+                        p.op_id           = $op_id,
+                        p.source          = 'op',
+                        p.updated_at      = $now
+                """, {
+                    "pid": pid,
+                    "name": name,
+                    "name_norm": record.get("name_normalized", ""),
+                    "role": record.get("public_role", "Narodni poslanik/Narodni poslanica"),
+                    "party": record.get("party_name", ""),
+                    "abbr": record.get("party_abbr", ""),
+                    "bdate": record.get("birth_date", ""),
+                    "city": record.get("city", ""),
+                    "prof": record.get("profession", ""),
+                    "op_id": op_id,
+                    "now": datetime.utcnow().isoformat(),
+                })
+
+                # EMPLOYED_BY Narodna skupština
+                run_query("""
+                    MERGE (i:Institution {institution_id: 'INST-NSRS'})
+                    SET i.name = 'Narodna skupština Republike Srbije'
+                    WITH i
+                    MATCH (p:Person {person_id: $pid})
+                    MERGE (p)-[r:EMPLOYED_BY]->(i)
+                    SET r.role  = 'Narodni poslanik/Narodni poslanica',
+                        r.source = 'op'
+                """, {"pid": pid})
+
+                # MEMBER_OF political party
+                party_name = record.get("party_name", "")
+                if party_name and len(party_name) > 2:
+                    party_id = f"PARTY-{abs(hash(party_name)) % 10**6}"
+                    run_query("""
+                        MERGE (pp:PoliticalParty {party_id: $ppid})
+                        SET pp.name = $party_name, pp.abbr = $abbr
+                        WITH pp
+                        MATCH (p:Person {person_id: $pid})
+                        MERGE (p)-[:MEMBER_OF]->(pp)
+                    """, {
+                        "ppid": party_id,
+                        "party_name": party_name,
+                        "abbr": record.get("party_abbr", ""),
+                        "pid": pid,
+                    })
+
+                # DIRECTS company links
+                for role_rec in record.get("company_roles", []):
+                    co_name = role_rec.get("company_name", "").strip()
+                    co_norm = role_rec.get("company_name_normalized", "") or normalize_company_name(co_name)
+                    if not co_name or len(co_name) < 3:
+                        continue
+
+                    real_mbs = self._find_real_companies(co_name, co_norm)
+
+                    if real_mbs:
+                        for real_mb in real_mbs:
+                            run_query("""
+                                MATCH (p:Person {person_id: $pid})
+                                MATCH (co:Company {maticni_broj: $mb})
+                                MERGE (p)-[r:DIRECTS]->(co)
+                                SET r.role       = $role,
+                                    r.source     = 'op',
+                                    r.income_rsd = $income
+                            """, {
+                                "pid": pid,
+                                "mb": real_mb,
+                                "role": role_rec.get("role", "Direktor"),
+                                "income": role_rec.get("income_rsd"),
+                            })
+                        linked_companies += 1
+                    else:
+                        # Create a stub Company node for the named company
+                        import hashlib
+                        co_id = f"CO-OP-{int(hashlib.md5(co_name.encode()).hexdigest(), 16) % 10**10}"
+                        run_query("""
+                            MERGE (co:Company {maticni_broj: $mb})
+                            SET co.name            = $name,
+                                co.name_normalized = $norm,
+                                co.source          = 'op',
+                                co.updated_at      = $now
+                            WITH co
+                            MATCH (p:Person {person_id: $pid})
+                            MERGE (p)-[r:DIRECTS]->(co)
+                            SET r.role       = $role,
+                                r.source     = 'op',
+                                r.income_rsd = $income
+                        """, {
+                            "mb": co_id,
+                            "name": co_name,
+                            "norm": co_norm,
+                            "pid": pid,
+                            "role": role_rec.get("role", "Direktor"),
+                            "income": role_rec.get("income_rsd"),
+                            "now": datetime.utcnow().isoformat(),
+                        })
+
+                loaded += 1
+            except Exception as e:
+                logger.error("op_load_failed", path=path, error=str(e))
+
+        # Try to merge any existing stubs (from previous loads) to real nodes
+        self._merge_op_stubs()
+        logger.info("op_load_done", loaded=loaded, linked_companies=linked_companies)
+
+    def deduplicate_institutions(self):
+        """Merge duplicate Institution nodes that share the same PIB.
+
+        When both ujn and jnportal data load the same institution, two nodes are created
+        with different institution_id values but the same PIB. This step moves all
+        AWARDED_CONTRACT and EMPLOYED_BY relationships to the canonical node (with the
+        most data), then removes the duplicate.
+        """
+        # Find duplicate PIBs — for each, pick the node with more properties as canonical
+        dupes = run_query("""
+            MATCH (i:Institution)
+            WHERE i.pib IS NOT NULL AND i.pib <> ''
+            WITH i.pib AS pib, collect(i) AS nodes
+            WHERE size(nodes) > 1
+            RETURN pib, [n IN nodes | n.institution_id] AS ids
+        """)
+        merged = 0
+        for row in dupes:
+            pib = row["pib"]
+            # Re-fetch nodes ordered by relationship count desc to pick canonical
+            nodes = run_query("""
+                MATCH (i:Institution {pib: $pib})
+                OPTIONAL MATCH (i)-[r]-()
+                RETURN i.institution_id AS iid, count(r) AS rels
+                ORDER BY rels DESC
+            """, {"pib": pib})
+            if len(nodes) < 2:
+                continue
+            canonical_iid = nodes[0]["iid"]
+            for dup in nodes[1:]:
+                dup_iid = dup["iid"]
+                if not dup_iid or dup_iid == canonical_iid:
+                    continue
+                # Move AWARDED_CONTRACT rels from duplicate to canonical
+                run_query("""
+                    MATCH (canonical:Institution {institution_id: $can})
+                    MATCH (dup:Institution {institution_id: $dup})
+                    MATCH (dup)-[:AWARDED_CONTRACT]->(ct:Contract)
+                    MERGE (canonical)-[:AWARDED_CONTRACT]->(ct)
+                """, {"can": canonical_iid, "dup": dup_iid})
+                # Move EMPLOYED_BY rels
+                run_query("""
+                    MATCH (canonical:Institution {institution_id: $can})
+                    MATCH (dup:Institution {institution_id: $dup})
+                    MATCH (p:Person)-[:EMPLOYED_BY]->(dup)
+                    MERGE (p)-[:EMPLOYED_BY]->(canonical)
+                """, {"can": canonical_iid, "dup": dup_iid})
+                # Delete duplicate's relationships then the node
+                run_query("""
+                    MATCH (dup:Institution {institution_id: $dup})
+                    DETACH DELETE dup
+                """, {"dup": dup_iid})
+                merged += 1
+        logger.info("institutions_deduplicated", merged=merged)
+        return merged
 
     def load_ujn_institutions(self):
         """Load institution records produced by the UJN bulk scraper."""
@@ -98,6 +417,7 @@ class GraphLoader:
             self._load_jnportal_contract(rec)
             loaded += 1
         logger.info("jnportal_load_done", loaded=loaded)
+        self.deduplicate_institutions()
 
     def _load_jnportal_institution(self, record: dict):
         """MERGE an institution from JN Portal data (PIB-keyed)."""
@@ -295,11 +615,16 @@ class GraphLoader:
             """, {"mb": mb, "cid": cid})
 
     def _load_party(self, record: dict):
-        """MERGE a real political party from data.gov.rs."""
+        """MERGE a real political party from data.gov.rs.
+
+        Also creates a Person node for the party leader and links them via MEMBER_OF,
+        so leader→company connections can be detected.
+        """
         party_id = record.get("party_id")
         name = record.get("name", "")
         if not party_id or not name:
             return
+        leader_name = record.get("leader", "")
         run_query("""
             MERGE (pp:PoliticalParty {party_id: $pid})
             SET pp.name            = $name,
@@ -309,7 +634,7 @@ class GraphLoader:
                 pp.address         = $address,
                 pp.city            = $city,
                 pp.leader          = $leader,
-                pp.source          = 'data.gov.rs',
+                pp.source          = 'opendata',
                 pp.verification_url = 'https://data.gov.rs/sr/datasets/politichke-stranke/',
                 pp.updated_at      = $now
         """, {
@@ -320,24 +645,72 @@ class GraphLoader:
             "founded": record.get("founded", ""),
             "address": record.get("address", ""),
             "city": record.get("city", ""),
-            "leader": record.get("leader", ""),
+            "leader": leader_name,
             "now": datetime.utcnow().isoformat(),
         })
 
+        # Create a Person node for the party leader so they can be cross-referenced
+        # with APR director data and contract detections
+        if leader_name and len(leader_name) > 3:
+            resolved = self.resolver.resolve_person(leader_name, source="opendata")
+            pid = resolved.canonical_id
+            run_query("""
+                MERGE (p:Person {person_id: $pid})
+                SET p.full_name       = $name,
+                    p.name_normalized = $name_norm,
+                    p.current_role    = 'Predsednik stranke',
+                    p.source          = coalesce(p.source, 'opendata'),
+                    p.updated_at      = $now
+                WITH p
+                MATCH (pp:PoliticalParty {party_id: $party_id})
+                MERGE (p)-[:MEMBER_OF]->(pp)
+            """, {
+                "pid": pid,
+                "name": leader_name,
+                "name_norm": normalize_company_name(leader_name),
+                "party_id": party_id,
+                "now": datetime.utcnow().isoformat(),
+            })
+
     def load_apr_data(self):
-        """Load all APR JSON files from data/raw/apr/."""
+        """Load all APR JSON files from data/raw/apr/ (including companywall enrichment)."""
         apr_dir = os.path.join(DATA_DIR, "raw", "apr")
-        files = glob.glob(os.path.join(apr_dir, "*.json"))
+        files = [f for f in glob.glob(os.path.join(apr_dir, "*.json"))
+                 if os.path.basename(f) != "directors.json"]
         logger.info("apr_load_start", files=len(files))
         loaded = 0
+        director_records = []
         for path in files:
             try:
                 with open(path, encoding="utf-8") as f:
                     record = json.load(f)
+                # Handle both list (directors.json) and dict (company JSON) formats
+                if isinstance(record, list):
+                    director_records.extend(record)
+                    continue
                 self._load_company(record)
                 loaded += 1
+                # Load inline directors from companywall records
+                for director in record.get("directors", []):
+                    director_records.append(director)
             except Exception as e:
                 logger.error("apr_load_failed", path=path, error=str(e))
+
+        # Load standalone directors.json if present
+        directors_path = os.path.join(apr_dir, "directors.json")
+        if os.path.exists(directors_path):
+            try:
+                with open(directors_path, encoding="utf-8") as f:
+                    director_records.extend(json.load(f))
+            except Exception as e:
+                logger.error("directors_json_load_failed", error=str(e))
+
+        # Load director→company relationships
+        if director_records:
+            from backend.scrapers.apr_director_scraper import load_directors_to_neo4j
+            dir_loaded = load_directors_to_neo4j(director_records)
+            logger.info("apr_directors_loaded", count=dir_loaded)
+
         logger.info("apr_load_done", loaded=loaded, total=len(files))
 
     def load_procurement_data(self):
@@ -389,7 +762,7 @@ class GraphLoader:
         logger.info("gazette_load_done", loaded=loaded, total=len(files))
 
     def load_rgz_data(self):
-        """Load all RGZ JSON files from data/raw/rgz/."""
+        """Load all RGZ JSON files from data/raw/rgz/ (single records or lists)."""
         rgz_dir = os.path.join(DATA_DIR, "raw", "rgz")
         files = glob.glob(os.path.join(rgz_dir, "*.json"))
         logger.info("rgz_load_start", files=len(files))
@@ -397,9 +770,11 @@ class GraphLoader:
         for path in files:
             try:
                 with open(path, encoding="utf-8") as f:
-                    record = json.load(f)
-                self._load_property(record)
-                loaded += 1
+                    data = json.load(f)
+                records = data if isinstance(data, list) else [data]
+                for record in records:
+                    self._load_property(record)
+                    loaded += 1
             except Exception as e:
                 logger.error("rgz_load_failed", path=path, error=str(e))
         logger.info("rgz_load_done", loaded=loaded, total=len(files))
@@ -569,7 +944,7 @@ class GraphLoader:
 
         owner_name = record.get("owner_name", "")
         owner_type = record.get("owner_type", "person")
-        owner_mb = record.get("owner_mb", "")
+        owner_mb = record.get("owner_mb", "") or record.get("owner_pib", "")
 
         if owner_name and owner_type == "person":
             resolved = self.resolver.resolve_person(owner_name, source="rgz")
@@ -649,29 +1024,25 @@ class GraphLoader:
             """, {"iid": inst_id, "name": inst_name, "bid": budget_id})
 
     def _load_company(self, record: dict):
-        """Merge a company record into Neo4j."""
+        """Merge a company record into Neo4j.
+
+        Companies may exist in two forms:
+        - Keyed by maticni_broj (from APR/procurement data)
+        - Keyed by PIB (from jnportal; maticni_broj defaults to PIB)
+        When both the real maticni_broj AND pib are known, propagate APR enrichment
+        fields (founding_date, activity, etc.) to the PIB-keyed node too so that
+        detection queries that traverse WON_CONTRACT can find founding_date.
+        """
         mb = record.get("maticni_broj", "")
         if not mb:
             return
 
-        resolved = self.resolver.resolve_company(
-            record.get("name", ""), mb=mb, source="apr"
-        )
+        pib = record.get("pib", "")
+        self.resolver.resolve_company(record.get("name", ""), mb=mb, source="apr")
 
-        run_query("""
-            MERGE (c:Company {maticni_broj: $mb})
-            SET c.pib               = $pib,
-                c.name              = $name,
-                c.name_normalized   = $name_norm,
-                c.status            = $status,
-                c.activity_code     = $act_code,
-                c.activity_name     = $act_name,
-                c.founding_date     = $founding,
-                c.source            = 'apr',
-                c.updated_at        = $now
-        """, {
+        params = {
             "mb": mb,
-            "pib": record.get("pib", ""),
+            "pib": pib,
             "name": record.get("name", ""),
             "name_norm": record.get("name_normalized") or normalize_company_name(record.get("name", "")),
             "status": record.get("status", ""),
@@ -679,7 +1050,38 @@ class GraphLoader:
             "act_name": record.get("activity_name", ""),
             "founding": record.get("founding_date", ""),
             "now": datetime.utcnow().isoformat(),
-        })
+        }
+
+        # Primary MERGE on maticni_broj
+        run_query("""
+            MERGE (c:Company {maticni_broj: $mb})
+            SET c.pib               = coalesce(c.pib, $pib),
+                c.name              = coalesce(c.name, $name),
+                c.name_normalized   = coalesce(c.name_normalized, $name_norm),
+                c.status            = coalesce(c.status, $status),
+                c.activity_code     = coalesce(c.activity_code, $act_code),
+                c.activity_name     = coalesce(c.activity_name, $act_name),
+                c.founding_date     = coalesce(c.founding_date, $founding),
+                c.source            = CASE WHEN c.source IS NULL THEN 'apr' ELSE c.source END,
+                c.apr_enriched      = true,
+                c.updated_at        = $now
+        """, params)
+
+        # If PIB exists and differs from MB, also propagate APR enrichment to any
+        # jnportal-keyed node that uses PIB as its maticni_broj (jnportal fallback).
+        # Do NOT change the node's key properties to avoid conflicts.
+        if pib and pib != mb:
+            run_query("""
+                MATCH (c:Company {pib: $pib})
+                WHERE c.maticni_broj = $pib OR c.maticni_broj IS NULL
+                SET c.name           = coalesce(c.name, $name),
+                    c.name_normalized = coalesce(c.name_normalized, $name_norm),
+                    c.activity_code  = coalesce(c.activity_code, $act_code),
+                    c.activity_name  = coalesce(c.activity_name, $act_name),
+                    c.founding_date  = coalesce(c.founding_date, $founding),
+                    c.apr_enriched   = true,
+                    c.updated_at     = $now
+            """, params)
 
         # Load address
         city = record.get("address_city", "")

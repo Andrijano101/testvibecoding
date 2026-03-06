@@ -136,12 +136,31 @@ def match_persons(name1: str, name2: str, jmbg1: str = "", jmbg2: str = "") -> t
     # Token sort ratio (handles name reordering: "Petar Marko" == "Marko Petar")
     score = fuzz.token_sort_ratio(n1, n2)
     if score >= NAME_MATCH_THRESHOLD:
+        # Extra guard for multi-token names: every token in the shorter name must
+        # find a high-similarity match in the longer name. This prevents false positives
+        # like "Slobodan Ilić" → "Slobodan Bisić" or "Milan Stamatović" → "Ivana Stamatović".
+        t1 = n1.split()
+        t2 = n2.split()
+        if len(t1) >= 2 and len(t2) >= 2:
+            short_t = t1 if len(t1) <= len(t2) else t2
+            long_t = t2 if len(t1) <= len(t2) else t1
+            for tok in short_t:
+                if len(tok) <= 2:
+                    continue  # skip initials like "m."
+                best = max(fuzz.ratio(tok, lt) for lt in long_t)
+                if best < 83:
+                    return False, score / 100.0, "no_match"
         return True, score / 100.0, "name_fuzzy"
 
-    # Partial ratio for substring matching (handles missing middle names)
+    # Partial ratio for substring matching (handles missing middle names/initials)
+    # Require that ALL tokens of the shorter name appear in the longer name's tokens
+    # to avoid matching e.g. "ANA KRSTIĆ" → "Zoran Krstić" (shared last name only)
     partial = fuzz.partial_ratio(n1, n2)
     if partial >= 95 and min(len(n1), len(n2)) > 5:
-        return True, partial / 100.0 * 0.8, "name_partial"
+        short_tokens = set((n1 if len(n1) <= len(n2) else n2).split())
+        long_tokens = set((n2 if len(n1) <= len(n2) else n1).split())
+        if short_tokens.issubset(long_tokens):
+            return True, partial / 100.0 * 0.8, "name_partial"
 
     return False, score / 100.0, "no_match"
 

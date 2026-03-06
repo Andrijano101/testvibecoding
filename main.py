@@ -17,7 +17,7 @@ from typing import Optional
 
 import csv
 import io
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, StreamingResponse, HTMLResponse
 from contextlib import asynccontextmanager
@@ -129,12 +129,22 @@ def get_stats():
     """)
     if not result:
         return DashboardStats()
+
+    # Count distinct real data sources (exclude seed/test)
+    source_rows = run_query("""
+        MATCH (n)
+        WHERE n.source IS NOT NULL AND n.source <> 'seed'
+        RETURN DISTINCT n.source AS src
+    """)
+    active_sources = len([r for r in source_rows if r.get("src") not in (None, "", "seed")])
+
     return DashboardStats(
         total_persons=result.get("persons", 0),
         total_companies=result.get("companies", 0),
         total_contracts=result.get("contracts", 0),
         total_institutions=result.get("institutions", 0),
         total_relationships=result.get("rels", 0),
+        data_sources_active=active_sources,
     )
 
 
@@ -335,9 +345,9 @@ def detect_donor_contracts():
 
 
 @app.get("/detect/repeated-winner")
-def detect_repeated_winner(min_contracts: int = 3):
+def detect_repeated_winner(min_contracts: int = 3, min_total: float = 5_000_000):
     """Detect companies that repeatedly win from the same institution."""
-    query, params = detection.repeated_winner(min_contracts=min_contracts)
+    query, params = detection.repeated_winner(min_contracts=min_contracts, min_total_rsd=int(min_total))
     return {"patterns": run_query(query, params)}
 
 
@@ -346,6 +356,66 @@ def detect_new_company_big_contract(max_age_years: int = 3, min_value: float = 5
     """Detect recently-founded companies winning large contracts."""
     query, params = detection.new_company_big_contract(max_age_years=max_age_years, min_value_rsd=int(min_value))
     return {"patterns": run_query(query, params)}
+
+
+@app.get("/detect/direct-official-contractor")
+def detect_direct_official_contractor(min_value: float = 1_000_000):
+    """Sukob interesa (direktni): official directly owns/directs a contractor company."""
+    query, params = detection.direct_official_contractor(min_value_rsd=int(min_value))
+    return {"patterns": run_query(query, params)}
+
+
+@app.get("/detect/ghost-director")
+def detect_ghost_director(min_contracts: int = 2):
+    """Fantomski direktor: person directs multiple companies winning from same institution."""
+    query, params = detection.ghost_director(min_contracts=min_contracts)
+    return {"patterns": run_query(query, params)}
+
+
+@app.get("/detect/institutional-monopoly")
+def detect_institutional_monopoly(min_pct: float = 0.7, min_value: float = 10_000_000, min_contracts: int = 3):
+    """Monopol institucije: one company gets ≥70% of an institution's total contract value."""
+    query, params = detection.institutional_monopoly(min_pct=min_pct, min_value_rsd=int(min_value), min_contracts=min_contracts)
+    return {"patterns": run_query(query, params)}
+
+
+@app.get("/detect/samododeljivanje")
+def detect_samododeljivanje(min_value: float = 1_000_000):
+    """Samododeljivanje (proxy): official owns/directs a company that won public contracts."""
+    query, params = detection.samododeljivanje_proxy(min_value_rsd=int(min_value))
+    return {"patterns": run_query(query, params)}
+
+
+@app.post("/ingest/apr-directors")
+async def ingest_apr_directors(background_tasks: BackgroundTasks, force_refresh: bool = False):
+    """
+    Enrich company data with APR director/owner information.
+    Loads Person→DIRECTS/OWNS→Company relationships needed for:
+    - Sukob interesa (direct_official_contractor)
+    - Samododeljivanje (samododeljivanje_proxy)
+    - Ghost director (ghost_director)
+
+    NOTE: APR live scraping requires reCAPTCHA — currently uses cached/curated data.
+    To load custom director data: PUT data to data/raw/apr/directors.json
+    with format: [{person_name, company_pib, role, institution_name?, ...}]
+    """
+    from backend.scrapers.apr_director_scraper import APRDirectorScraper, load_directors_to_neo4j
+    import json, os
+
+    def _run():
+        scraper = APRDirectorScraper()
+        summary = scraper.scrape(force_refresh=force_refresh)
+
+        # Load scraped directors into Neo4j
+        out_file = os.path.join(os.getenv("DATA_DIR", "./data"), "raw", "apr", "directors.json")
+        if os.path.exists(out_file):
+            with open(out_file) as f:
+                directors = json.load(f)
+            loaded = load_directors_to_neo4j(directors)
+            logger.info("apr_directors_loaded", count=loaded)
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "message": "APR director enrichment running in background"}
 
 
 @app.get("/detect/all")
@@ -559,9 +629,14 @@ def get_suspicious_graph(limit: int = Query(300, ge=10, le=1000)):
         detection.revolving_door,
         detection.political_donor_contracts,
         lambda: detection.single_bidder_contracts(1_000_000),
-        lambda: detection.contract_splitting(6_000_000),
-        lambda: detection.repeated_winner(min_contracts=2),
+        lambda: detection.contract_splitting(15_000_000),
+        lambda: detection.repeated_winner(min_contracts=3, min_total_rsd=5_000_000),
         lambda: detection.new_company_big_contract(max_age_years=3, min_value_rsd=5_000_000),
+        # Real-data patterns (fire once APR/ACAS enrichment loaded)
+        lambda: detection.direct_official_contractor(),
+        lambda: detection.ghost_director(),
+        lambda: detection.institutional_monopoly(),
+        lambda: detection.samododeljivanje_proxy(),
     ]
 
     for func in detectors:
@@ -588,6 +663,19 @@ def get_suspicious_graph(limit: int = Query(300, ge=10, le=1000)):
         return {"nodes": [], "edges": [], "flagged_counts": {
             "companies": 0, "contracts": 0, "institutions": 0, "persons": 0,
         }}
+
+    # 1b. Find contracts that connect flagged companies to flagged institutions
+    # This ensures the graph has edges between flagged entities (not just isolated nodes)
+    if flagged_company_mbs and flagged_institution_ids:
+        connecting_contracts = run_query("""
+            MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct:Contract)<-[:WON_CONTRACT]-(co:Company)
+            WHERE inst.institution_id IN $inst_ids AND co.maticni_broj IN $co_mbs
+            RETURN ct.contract_id AS contract_id
+            LIMIT 200
+        """, {"inst_ids": list(flagged_institution_ids), "co_mbs": list(flagged_company_mbs)})
+        for row in connecting_contracts:
+            if row.get("contract_id"):
+                flagged_contract_ids.add(str(row["contract_id"]))
 
     # 2. Fetch nodes for each flagged set
     def _node_shape(n_alias: str) -> str:
@@ -797,6 +885,21 @@ def _run_scrape(source: str, since_days: int = 7, years: str = None, force_refre
             s.client.close()
             logger.info("scrape_done", source="jnportal")
 
+        if source in ("companywall", "apr", "all"):
+            from backend.scrapers.companywall_scraper import CompanyWallScraper
+            s = CompanyWallScraper()
+            max_co = int(os.getenv("CW_MAX_COMPANIES", "300"))
+            s.scrape(max_companies=max_co, force_refresh=force_refresh)
+            s.client.close()
+            logger.info("scrape_done", source="companywall")
+
+        if source in ("op", "otvoreni_parlament", "all"):
+            from backend.scrapers.otvoreni_parlament_scraper import OtvoreniParlamentScraper
+            s = OtvoreniParlamentScraper()
+            s.scrape_all(force_refresh=force_refresh)
+            s.close()
+            logger.info("scrape_done", source="op")
+
     except Exception as e:
         logger.error("scrape_failed", source=source, error=str(e))
 
@@ -824,6 +927,10 @@ def _run_load(source: str):
             loader.load_ujn_procurements()
         elif source == "jnportal":
             loader.load_jnportal_data()
+        elif source in ("companywall", "apr"):
+            loader.load_companywall_data()
+        elif source in ("op", "otvoreni_parlament"):
+            loader.load_op_data()
         else:
             loader.load_all()
     finally:
@@ -842,7 +949,7 @@ def trigger_scrape(
     source: rik | opendata | gazette | rgz | procurement | all
     Runs in a background thread (non-blocking).
     """
-    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "all"}
+    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "companywall", "apr", "op", "otvoreni_parlament", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
     t = threading.Thread(
@@ -865,11 +972,16 @@ def load_all_data():
 def load_source(source: str):
     """
     Load scraped data for a specific source into Neo4j.
-    source: apr | procurement | rik | gazette | rgz | opendata
+    source: apr | companywall | procurement | rik | gazette | rgz | opendata | deduplicate
     """
-    valid = {"apr", "procurement", "rik", "gazette", "rgz", "opendata", "ujn", "jnportal"}
+    valid = {"apr", "companywall", "procurement", "rik", "gazette", "rgz", "opendata", "ujn", "jnportal", "deduplicate"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
+    if source == "deduplicate":
+        from backend.etl.graph_loader import GraphLoader
+        loader = GraphLoader()
+        merged = loader.deduplicate_institutions()
+        return {"status": "done", "source": "deduplicate", "merged": merged}
     _run_load(source)
     return {"status": "done", "source": source}
 
@@ -908,7 +1020,7 @@ def ingest_source(
     For 'all': scrapes all sources then loads everything into Neo4j.
     This is the recommended way to populate with real data.
     """
-    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "all"}
+    valid = {"rik", "opendata", "gazette", "rgz", "procurement", "ujn", "jnportal", "companywall", "apr", "op", "otvoreni_parlament", "all"}
     if source not in valid:
         raise HTTPException(400, f"Unknown source '{source}'. Valid: {sorted(valid)}")
 

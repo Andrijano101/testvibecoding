@@ -77,6 +77,10 @@ const PATTERN_LABELS = {
   political_donor_contract: "Donator→Ugovor",
   repeated_winner: "Stalni pobednik",
   new_company_big_contract: "Nova firma — veliki ugovor",
+  institutional_monopoly: "Institucionalni monopol",
+  samododeljivanje_proxy: "Poslanik/Funkcioner — direktor firme koja dobija ugovore",
+  direct_official_contractor: "Funkcioner direktno na obe strane ugovora",
+  ghost_director: "Fantomski direktor",
 };
 
 // Real Serbian government portal URLs for verification
@@ -225,6 +229,107 @@ const PATTERN_EXPLANATIONS = {
       { key: "contract_value", label: "Vrednost ugovora" },
       { key: "awarding_institution", label: "Institucija" },
       { key: "party_member_in_institution", label: "Član stranke u instituciji" },
+    ],
+  },
+  repeated_winner: {
+    icon: "🏆",
+    title: "Stalni pobednik",
+    why: "Ista firma pobeđuje na javnim nabavkama kod iste institucije više puta zaredom, osvajajući dominantan deo njenog ukupnog budžeta za nabavke. U zdravom sistemu, različite firme trebalo bi da pobede u različitim raspisima — stalno isti pobednik ukazuje da:\n\n• Konkurs je pisan po meri te firme (technički zahtevi, rokovi, specifikacije koji odgovaraju samo jednom ponuđaču)\n• Evaluaciona komisija sistematski favorizuje isti ponuđač\n• Ostale firme su obeshrabrene ili onemogućene da apliciraju (pritisak, neformalni dogovori)\n• Može biti posledica korupcije, personalnih veza između direktora firme i funkcionera, ili prethodnih 'revolving door' prelaza\n\nZakon o javnim nabavkama Srbije propisuje princip konkurentnosti — ponavljano osvajanje od jednog ponuđača je signal za reviziju.",
+    how: "(Firma)-[WON_CONTRACT]->(CT1, CT2, CT3...)\n(Institucija)-[AWARDED_CONTRACT]->(CT1, CT2, CT3...)\ngde: count(ugovori firma/institucija) >= 3\n  i: firma.ugovori / institucija.ukupno_ugovora >= 50%\n\nDodatni signal:\n- sve pobede u kratkom periodu (< 24 meseca)\n- kombinacija sa single_bidder na istim raspisima\n- visoka prosečna vrednost ugovora",
+    sourcePortals: ["procurement"],
+    sources: ["Portal javnih nabavki — istorija dodele ugovora po naručiocu i dobavljaču"],
+    fields: [
+      { key: "company_name", label: "Stalni pobednik" },
+      { key: "institution", label: "Institucija" },
+      { key: "win_count", label: "Broj pobeda" },
+      { key: "total_value", label: "Ukupna vrednost" },
+      { key: "first_win", label: "Prva pobeda" },
+      { key: "last_win", label: "Poslednja pobeda" },
+      { key: "share_pct", label: "% budžeta institucije" },
+    ],
+  },
+  new_company_big_contract: {
+    icon: "🆕",
+    title: "Nova firma — veliki ugovor",
+    why: "Novoosnovana firma (mlađa od 3 godine) osvaja javne ugovore visoke vrednosti bez dokazanog iskustva i poslovne istorije. Zakon o javnim nabavkama zahteva od ponuđača dokaze o referentnim ugovorima i finansijskom kapacitetu — pa se nameće pitanje kako firma bez istorije ispunjava te uslove.\n\nKarakterstični scenariji:\n\n• Firma osnovana neposredno pre raspisivanja konkursa — kao da je 'napravljena' posebno za taj tender\n• Ishodišna firma: postojeći direktor osniva novu firmu i 'prebacuje' ugovore na nju\n• Politički podobna firma: osnivač ili direktor ima veze sa strankom koja kontroliše instituciju\n• 'Školjka': nova firma nema zaposlenih ni kapaciteta — posao obavljaju kooperanti\n\nBG BUS PREVOZ d.o.o. je primer: osnovan juna 2024, u roku od meseci dobio je ugovor vrednosti 142 milijarde RSD (gradski prevoz Beograda). Bez prethodnih referenci, bez poslovne istorije.",
+    how: "(Firma)-[:WON_CONTRACT]->(Ugovor)\ngde: Firma.founding_date IS NOT NULL\n  i: award_year - founding_year <= 3\n  i: contract_value >= 5.000.000 RSD\n\nSeverity:\n  age = 0 (ista godina osnivanja): CRITICAL\n  age = 1 + value >= 10M: CRITICAL\n  age <= 2: HIGH\n  age = 3: MEDIUM",
+    sourcePortals: ["apr", "procurement"],
+    sources: ["APR — datum osnivanja firme", "Portal javnih nabavki — datum i vrednost ugovora"],
+    fields: [
+      { key: "company_name", label: "Firma" },
+      { key: "founded", label: "Datum osnivanja" },
+      { key: "age_at_award", label: "Starost firme (god.)" },
+      { key: "num_contracts", label: "Broj ugovora" },
+      { key: "total_value", label: "Ukupna vrednost" },
+      { key: "contract_title", label: "Najveći ugovor" },
+      { key: "contract_value", label: "Vrednost najvećeg" },
+      { key: "award_date", label: "Datum dodele" },
+      { key: "institution", label: "Naručilac" },
+    ],
+  },
+  samododeljivanje_proxy: {
+    icon: "🏛",
+    title: "Poslanik/Funkcioner — direktor firme koja dobija ugovore",
+    why: "Narodni poslanik ili javni funkcioner istovremeno obavlja direktorsku funkciju u firmi koja osvaja javne ugovore. Ovo je direktni sukob interesa — zakon o javnim nabavkama zahteva nepristrasnost, ali lice koje kontroliše firmu može koristiti politički uticaj da osigura ugovore. Primer: Dušan Bajatović (poslanik SPS) generalni je direktor JP Srbijagasa, koji dobija ugovore vredne milijarde RSD.",
+    how: "(Poslanik/Funkcioner)-[EMPLOYED_BY]->(Skupština/Vlada)\n(Poslanik/Funkcioner)-[DIRECTS]->(Firma)\n(Firma)-[WON_CONTRACT]->(Ugovor)\n(BilokojInstitucija)-[AWARDED_CONTRACT]->(Ugovor)\n\nNe zahteva da institucija koja zapošljava bude ista koja dodeljuje ugovor —\npolitički uticaj deluje posredno.",
+    sourcePortals: ["parliament", "apr", "procurement"],
+    sources: ["Otvoreni Parlament — imovinska karta poslanika (direktorska mesta)", "APR — registar preduzetnika i firmi", "Portal javnih nabavki — ugovori"],
+    fields: [
+      { key: "official_name", label: "Poslanik/Funkcioner" },
+      { key: "official_role", label: "Javna pozicija" },
+      { key: "employer_institution", label: "Institucija" },
+      { key: "company_name", label: "Firma kojom rukovodi" },
+      { key: "contract_title", label: "Ugovor" },
+      { key: "contract_value", label: "Vrednost ugovora" },
+      { key: "awarding_institution", label: "Naručilac" },
+      { key: "award_date", label: "Datum dodele" },
+    ],
+  },
+  direct_official_contractor: {
+    icon: "⚡",
+    title: "Funkcioner direktno na obe strane ugovora",
+    why: "Isti funkcioner je zaposlen u instituciji koja dodeljuje ugovor I istovremeno rukovodi firmom koja taj ugovor dobija — bez posrednika (porodičnog člana i sl.). Najdirektniji oblik sukoba interesa: ista osoba kontroliše i naručioca i dobavljača.",
+    how: "(Funkcioner)-[EMPLOYED_BY]->(Institucija)\n(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n(Firma)-[WON_CONTRACT]->(Ugovor)\n(Funkcioner)-[DIRECTS|OWNS]->(Firma)\n\nSvi elementi moraju biti isti — Funkcioner je i kod naručioca i u firmi pobedniku.",
+    sourcePortals: ["officials", "apr", "procurement"],
+    sources: ["Evidencije funkcionera", "APR — direktorska mesta", "Portal javnih nabavki"],
+    fields: [
+      { key: "official_name", label: "Funkcioner" },
+      { key: "official_role", label: "Pozicija" },
+      { key: "institution", label: "Institucija naručilac" },
+      { key: "company_name", label: "Firma" },
+      { key: "contract_title", label: "Ugovor" },
+      { key: "contract_value", label: "Vrednost" },
+      { key: "award_date", label: "Datum" },
+    ],
+  },
+  ghost_director: {
+    icon: "👤",
+    title: "Fantomski direktor",
+    why: "Lice je formalno direktno više firmi koje zajedno osvajaju ugovore od iste institucije — ali nema fizičku mogućnost da stvarno rukovodi svima. Čest obrazac pri korišćenju 'front' kompanija: nominalni direktor potpisuje dokumenta, a stvarni vlasnik ostaje u senci.",
+    how: "(Osoba)-[DIRECTS]->(Firma1)\n(Osoba)-[DIRECTS]->(Firma2)\n(Firma1)-[WON_CONTRACT]->(Ugovor1)\n(Firma2)-[WON_CONTRACT]->(Ugovor2)\n(IstaInstitucija)-[AWARDED_CONTRACT]->(Ugovor1)\n(IstaInstitucija)-[AWARDED_CONTRACT]->(Ugovor2)\n\nNajmanje 2 firme, iste institucije.",
+    sourcePortals: ["apr", "procurement"],
+    sources: ["APR — direktorska imenovanja", "Portal javnih nabavki — pobednici nabavki"],
+    fields: [
+      { key: "director_name", label: "Direktor" },
+      { key: "institution", label: "Institucija" },
+      { key: "num_companies", label: "Broj firmi" },
+      { key: "total_value", label: "Ukupna vrednost" },
+    ],
+  },
+  institutional_monopoly: {
+    icon: "🏛",
+    title: "Institucionalni monopol",
+    why: "Jedna firma prima 70% ili više celokupnog budžeta javnih nabavki jedne institucije. Ovo nije slučajnost — ukazuje na sistemsko zarobljavanje nabavnog procesa ('procurement capture'):\n\n• Konkursna dokumentacija je konstruisana tako da praktično samo jedna firma može ispuniti uslove\n• Evaluatori imaju uputstvo ili implicitni pritisak da biraju unapred određenog pobednika\n• Institucija je u neformalno zavisnom odnosu sa firmom (personalne veze, podmićivanje, politički uticaj)\n• Ostale firme su naučile da ne apliciraju jer znaju da nemaju šanse\n\nPrincip: ako je ceo javni budžet jedne institucije faktički privatizovan od strane jedne firme, to nije tržišna utakmica — to je monopol na javnom novcu. Svaki evro koji ide jednoj firmi je evro koji nije podložan stvarnoj konkurenciji.\n\nPrema EU standardima i SIGMA metodologiji, koncentracija > 50% kod jednog dobavljača za jednu instituciju se klasifikuje kao crvena zastavica za korupciju.",
+    how: "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n(Firma)-[WON_CONTRACT]->(Ugovor)\n\nAGREGACIJA:\n  firma_vrednost = SUM(value_rsd gde pobednik = Firma)\n  institucija_ukupno = SUM(value_rsd sve nabavke)\n  udeo = firma_vrednost / institucija_ukupno\n\nUSLOV:\n  udeo >= 0.70  (tj. firma dobija >= 70% budžeta)\n  firma_vrednost >= 10.000.000 RSD  (minimalni prag relevantnosti)",
+    sourcePortals: ["procurement"],
+    sources: ["Portal javnih nabavki (UJN) — svi ugovori institucije grupisani po dobavljaču"],
+    fields: [
+      { key: "institution", label: "Institucija" },
+      { key: "company_name", label: "Dominantni dobavljač" },
+      { key: "company_pct_of_institution", label: "Udeo u budžetu (%)" },
+      { key: "company_total_value", label: "Vrednost ugovora firme" },
+      { key: "institution_total_value", label: "Ukupan budžet institucije" },
+      { key: "num_contracts", label: "Broj ugovora" },
     ],
   },
 };
@@ -734,6 +839,7 @@ function EntityBrowser({ type, label, color, onClose, onSelectEntity }) {
 // ── Main Dashboard ──────────────────────────────────────────────
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState("graph");
+  const [showTestData, setShowTestData] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -857,12 +963,29 @@ export default function Dashboard() {
     setSelectedNode(null); setSelectedAlert(null); setDetailAlert(null); setHighlightIds(null);
   };
 
+  const isSeedAlert = a => {
+    const ids = [a.company_mb, a.company_id, a.official_id, a.person_id, a.institution_id,
+                 a.id_1, a.id_2, a.institution_1_id, a.institution_2_id].filter(Boolean).join(" ");
+    return ids.includes("SEED") || ids.includes("seed");
+  };
+
   const filteredAlerts = useMemo(() =>
-    alerts.filter(a =>
-      !searchQuery ||
-      Object.values(a).join(" ").toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (PATTERN_LABELS[a.pattern_type] || "").toLowerCase().includes(searchQuery.toLowerCase())
-    ), [alerts, searchQuery]);
+    alerts.filter(a => {
+      if (!showTestData && isSeedAlert(a)) return false;
+      return !searchQuery ||
+        Object.values(a).join(" ").toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (PATTERN_LABELS[a.pattern_type] || "").toLowerCase().includes(searchQuery.toLowerCase());
+    }), [alerts, searchQuery, showTestData]);
+
+  const visibleNodes = useMemo(() =>
+    showTestData ? nodes : nodes.filter(n => n.props?.source !== 'seed'),
+    [nodes, showTestData]);
+
+  const visibleEdges = useMemo(() => {
+    if (showTestData) return edges;
+    const visibleIds = new Set(visibleNodes.map(n => n.id));
+    return edges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
+  }, [edges, visibleNodes, showTestData]);
 
   const realNodeCount = useMemo(() => nodes.filter(n => n.props?.source !== 'seed').length, [nodes]);
   const testNodeCount = useMemo(() => nodes.filter(n => n.props?.source === 'seed').length, [nodes]);
@@ -870,18 +993,9 @@ export default function Dashboard() {
   // Honest source registry — what data is actually in the DB and where it came from
   const SOURCE_REGISTRY = [
     {
-      key: "seed",
-      name: "Sintetički test podaci",
-      description: "Veštački podaci generisani za demonstraciju svih 8 obrazaca korupcije. NISU pravi podaci — služe isključivo za testiranje. Čvorovi su vizuelno označeni isprekidanim okvirom i natpisom TEST.",
-      badge: "TEST",
-      badgeColor: "#f59e0b",
-      url: null,
-      countLabel: "čvorova",
-    },
-    {
       key: "jnportal",
       name: "JN Portal — Portal javnih nabavki",
-      description: "Pravi ugovori o javnim nabavkama sa jnportal.ujn.gov.rs — naziv pobednika, PIB kompanije, vrednost ugovora, datum. 1.3M+ ugovora ukupno; skupljaju se ugovori >1M RSD sortirani po vrednosti.",
+      description: "Pravi ugovori o javnim nabavkama sa jnportal.ujn.gov.rs — naziv pobednika, PIB kompanije, vrednost ugovora, datum. 1.3M+ ugovora ukupno; skupljaju se top ugovori sortirani po vrednosti.",
       badge: "AKTIVAN",
       badgeColor: "#10b981",
       url: "https://jnportal.ujn.gov.rs/contracts",
@@ -889,64 +1003,83 @@ export default function Dashboard() {
       countLabel: "čvorova",
     },
     {
-      key: "apr",
-      name: "APR — Agencija za privredne registre",
-      description: "Registar privrednih subjekata: vlasnici, direktori, matični brojevi, adrese, PIB. Zvanični javni registar poslovnih subjekata u Srbiji.",
-      badge: "PLANIRAN",
-      badgeColor: "#3b82f6",
-      url: "https://pretraga.apr.gov.rs",
-      urlLabel: "pretraga.apr.gov.rs",
-      countLabel: "firmi",
-    },
-    {
-      key: "procurement",
-      name: "Portal javnih nabavki — UJN",
-      description: "Svi javni ugovori objavljeni na portalu Uprave za javne nabavke: naručilac, vrednost, pobednik, broj ponuđača, datum.",
-      badge: "PLANIRAN",
-      badgeColor: "#3b82f6",
+      key: "ujn",
+      name: "UJN OpenData — istorijski tenderi",
+      description: "Istorijski podaci o javnim nabavkama sa portala Uprave za javne nabavke: institucija, vrednost, vrsta postupka, datum. Pokriva 2020. godinu i starije periode.",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
       url: "https://jnportal.ujn.gov.rs/tender-documents/search",
       urlLabel: "jnportal.ujn.gov.rs",
-      countLabel: "ugovora",
+      countLabel: "zapisa",
+    },
+    {
+      key: "op",
+      name: "Otvoreni Parlament — poslanici i imovinske karte",
+      description: "Profili svih aktuelnih narodnih poslanika sa otvoreniparlament.rs: stranka, imenovanje u odborima, imovinska karta (nekretnine, vozila, kompanije). Ključni izvor za detekciju konflikta interesa — poslanik kao direktor firme koja dobija javne ugovore.",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
+      url: "https://otvoreniparlament.rs/poslanik",
+      urlLabel: "otvoreniparlament.rs",
+      countLabel: "poslanika",
     },
     {
       key: "rik",
-      name: "Narodna skupština RS — poslanici",
-      description: "Lista poslanika, strančka pripadnost, komisije. Izvor: parlament.gov.rs. Skupljač pokušava živu stranu; u odsustvu vraća rezervne podatke.",
-      badge: "PLANIRAN",
-      badgeColor: "#3b82f6",
+      name: "Narodna skupština RS — poslanici (rezervni)",
+      description: "Rezervna lista poslanika sa parlament.gov.rs korišćena kao fallback kada primarni skupljač ne može da dohvati podatke. Otvoreni Parlament je primarni izvor.",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
       url: "https://www.parlament.gov.rs/members-of-parliament",
       urlLabel: "parlament.gov.rs",
       countLabel: "poslanika",
     },
     {
+      key: "apr",
+      name: "APR — Agencija za privredne registre",
+      description: "Registar privrednih subjekata: vlasnici, direktori, matični brojevi, adrese, PIB. Podaci se preuzimaju sa companywall.rs koji agregira javni APR registar. Pokriva privatne kompanije (državna preduzeća nisu na companywall.rs).",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
+      url: "https://pretraga.apr.gov.rs",
+      urlLabel: "pretraga.apr.gov.rs",
+      countLabel: "firmi",
+    },
+    {
       key: "opendata",
-      name: "data.gov.rs — Otvoreni podaci Srbije",
-      description: "CKAN portal: evidencija javnih funkcionera, finansiranje stranaka, izvršenje budžeta. Skuplja dataset ID-eve direktno sa API-ja.",
-      badge: "PLANIRAN",
-      badgeColor: "#3b82f6",
-      url: "https://data.gov.rs/sr/datasets/funkcioneri-i-javni-sluzbenici/",
+      name: "data.gov.rs — Registar stranaka",
+      description: "Registar aktivnih i istorijskih političkih stranaka sa data.gov.rs: naziv, predsednik, registarski broj, adresa, datum osnivanja.",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
+      url: "https://data.gov.rs/sr/datasets/politichke-stranke/",
       urlLabel: "data.gov.rs",
-      countLabel: "zapisa",
+      countLabel: "stranaka",
+    },
+    {
+      key: "rgz",
+      name: "RGZ — Katastar nekretnina",
+      description: "Vlasništvo nad nekretninama za privredne subjekte. Katastar parcele preuzimaju se iz companywall.rs koji integriše RGZ podatke.",
+      badge: "AKTIVAN",
+      badgeColor: "#10b981",
+      url: "https://rgz.gov.rs/usluge/eLine",
+      urlLabel: "rgz.gov.rs",
+      countLabel: "nekretnina",
     },
     {
       key: "gazette",
       name: "Službeni glasnik RS",
-      description: "Rešenja o postavljenjima i razrešenjima funkcionera objavljena u Službenom glasniku. Skupljač parsira pravno-informacioni-sistem.rs.",
-      badge: "PLANIRAN",
-      badgeColor: "#3b82f6",
+      description: "Rešenja o postavljenjima i razrešenjima funkcionera objavljena u Službenom glasniku RS. Skupljač parsira pravno-informacioni-sistem.rs.",
+      badge: "DELIMIČNO",
+      badgeColor: "#f59e0b",
       url: "https://www.pravno-informacioni-sistem.rs/SlGlasnikPortal/eli/collection",
       urlLabel: "pravno-informacioni-sistem.rs",
       countLabel: "rešenja",
     },
     {
-      key: "rgz",
-      name: "RGZ — Katastar nekretnina",
-      description: "Vlasništvo nad nekretninama po vlasniku ili adresi. Izvor: rgz.gov.rs/usluge/eLine. Skupljač zahteva unos vlasnika za pretragu.",
-      badge: "PLANIRAN",
-      badgeColor: "#3b82f6",
-      url: "https://rgz.gov.rs/usluge/eLine",
-      urlLabel: "rgz.gov.rs",
-      countLabel: "nekretnina",
+      key: "seed",
+      name: "Sintetički test podaci",
+      description: "Veštački podaci generisani za demonstraciju obrazaca korupcije. Služe isključivo za testiranje — čvorovi su vizuelno označeni isprekidanim okvirom i natpisom TEST. Uključeni su u grafičke prikaze samo kada je aktiviran toggle TEST.",
+      badge: "TEST",
+      badgeColor: "#f59e0b",
+      url: null,
+      countLabel: "čvorova",
     },
   ];
 
@@ -1074,6 +1207,22 @@ export default function Dashboard() {
                 </button>
               ))}
             </div>
+
+            <button
+              onClick={() => setShowTestData(s => !s)}
+              title={showTestData ? "Sakrij TEST/seed podatke" : "Prikaži TEST/seed podatke"}
+              style={{
+                padding: "5px 10px", fontSize: 10, fontWeight: 600,
+                background: showTestData ? "#f59e0b22" : "#1e293b",
+                border: `1px solid ${showTestData ? "#f59e0b55" : "#334155"}`,
+                color: showTestData ? "#f59e0b" : "#64748b",
+                borderRadius: 5, cursor: "pointer",
+                fontFamily: "'IBM Plex Mono', monospace",
+                letterSpacing: "0.04em", whiteSpace: "nowrap",
+              }}
+            >
+              {showTestData ? "◉ TEST" : "◌ TEST"}
+            </button>
           </div>
         </header>
 
@@ -1215,7 +1364,7 @@ export default function Dashboard() {
           {/* Main content */}
           <main style={{ flex: 1, position: "relative", overflow: "hidden" }}>
             {activeTab === "graph" && (
-              <ForceGraph nodes={nodes} edges={edges} onNodeClick={handleNodeClick} highlightIds={highlightIds} />
+              <ForceGraph nodes={visibleNodes} edges={visibleEdges} onNodeClick={handleNodeClick} highlightIds={highlightIds} />
             )}
 
             {activeTab === "alerts" && (
@@ -1256,7 +1405,7 @@ export default function Dashboard() {
                   {filteredAlerts.map((alert, i) => {
                     const exp = PATTERN_EXPLANATIONS[alert.pattern_type] || {};
                     const color = SEVERITY_COLORS[alert.severity];
-                    const moneyVal = alert.contract_value || alert.value_rsd || alert.total_value || alert.donation_amount;
+                    const moneyVal = alert.contract_value || alert.value_rsd || alert.total_value || alert.company_total_value || alert.donation_amount;
                     const isTestData = [alert.official_id, alert.family_id, alert.company_mb, alert.contract_id,
                       alert.person_id, alert.institution_id, alert.winner_mb].some(id => id && String(id).includes('SEED'));
                     return (
@@ -1297,8 +1446,17 @@ export default function Dashboard() {
                           {alert.pattern_type === 'repeated_winner' && alert.institution && (
                             <span> — <strong style={{ color: "#10b981" }}>{alert.institution}</strong> ({alert.num_contracts}× ugovora)</span>
                           )}
+                          {alert.pattern_type === 'institutional_monopoly' && alert.institution && (
+                            <span><strong style={{ color: "#10b981" }}>{alert.institution}</strong> → <strong style={{ color: "#3b82f6" }}>{alert.company_name}</strong>{alert.company_pct_of_institution != null ? ` (${alert.company_pct_of_institution}%)` : ""}</span>
+                          )}
                           {alert.pattern_type === 'new_company_big_contract' && alert.age_at_award != null && (
-                            <span> — osnovana {alert.founded}, ugovor {alert.age_at_award === 0 ? "iste godine" : `za ${alert.age_at_award} god.`}</span>
+                            <span> — osnovana {alert.founded}, ugovor {alert.age_at_award === 0 ? "iste godine" : `za ${alert.age_at_award} god.`}{alert.num_contracts > 1 ? `, ${alert.num_contracts} ugovora` : ""}</span>
+                          )}
+                          {alert.pattern_type === 'samododeljivanje_proxy' && alert.official_name && (
+                            <span><strong style={{ color: "#f87171" }}>{alert.official_name}</strong> → direktor: <strong style={{ color: "#3b82f6" }}>{alert.company_name}</strong></span>
+                          )}
+                          {alert.pattern_type === 'direct_official_contractor' && alert.official_name && (
+                            <span><strong style={{ color: "#f87171" }}>{alert.official_name}</strong> ({alert.institution}) → <strong style={{ color: "#3b82f6" }}>{alert.company_name}</strong></span>
                           )}
                         </div>
 
