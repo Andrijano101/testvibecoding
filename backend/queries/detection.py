@@ -123,9 +123,10 @@ def shell_company_clusters():
 def single_bidder_contracts(min_value_rsd: int = 2_000_000):
     """Contracts won through non-competitive procedures (single bid or negotiated without notice).
 
-    Proc types 3 and 9 in Serbian procurement law = negotiated procedure without prior
-    publication — competitive bidding was bypassed.
-    Threshold lowered to 2M RSD to catch mid-size contracts.
+    Proc types 3, 9 = negotiated procedure without prior publication (competitive bidding bypassed).
+    Proc type 11 = "jednostavna nabavka" (simple procurement, below 1M RSD threshold) — no competitive
+    bidding required. Flagged here when value >= min_value to catch systematic above-threshold abuse
+    and contracts just below the 1M line.
     """
     return """
     MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct:Contract)
@@ -135,7 +136,7 @@ def single_bidder_contracts(min_value_rsd: int = 2_000_000):
          ct.proc_type AS ptype,
          ct.num_bidders AS bidders
     WHERE val >= $min_value
-      AND (bidders = 1 OR ptype IN ['3', '9'])
+      AND (bidders = 1 OR ptype IN ['3', '9', '11'])
     WITH inst, ct, company, val, ptype,
          CASE
            WHEN val >= 50000000 THEN 'critical'
@@ -605,7 +606,8 @@ def zero_competition_repeat(min_value_rsd: int = 2_000_000, min_contracts: int =
     Detects: same institution awards 2+ contracts via negotiated/no-bid procedure
     to the same company. Each instance is suspicious; repetition is systemic.
     In Serbian law proc_type 3 = negotiated without prior notice,
-    proc_type 9 = direct agreement. Both bypass normal competitive tendering.
+    proc_type 9 = direct agreement, proc_type 11 = jednostavna nabavka (below 1M RSD).
+    All three bypass normal competitive tendering.
     """
     return """
     MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct:Contract)
@@ -615,7 +617,7 @@ def zero_competition_repeat(min_value_rsd: int = 2_000_000, min_contracts: int =
          ct.proc_type AS ptype,
          ct.num_bidders AS bidders
     WHERE val >= $min_value
-      AND (bidders = 1 OR ptype IN ['3', '9'])
+      AND (bidders = 1 OR ptype IN ['3', '9', '11'])
     WITH inst, co,
          count(ct) AS num_nocompetition,
          sum(coalesce(ct.value_rsd, ct.contract_value, 0)) AS total_value,
