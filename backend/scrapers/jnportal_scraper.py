@@ -260,7 +260,7 @@ class JNPortalScraper:
         skip = 0
         page_size = JNPORTAL_PAGE_SIZE
         total_scanned = 0
-        MAX_SCAN = max_rows * 20  # scan up to 20x to find enough matching rows
+        MAX_SCAN = max_rows * 4  # scan up to 4x to find enough matching rows
 
         logger.info("jnportal_proc_phase_start", proc_types=proc_types, max_rows=max_rows)
 
@@ -367,19 +367,37 @@ class JNPortalScraper:
         )
         logger.info("jnportal_phase2_done", count=len(phase2_contracts))
 
+        # Save partial results after Phase 2 so we don't lose data if Phase 3 is slow
+        partial_contracts = phase1_contracts + phase2_contracts
+        partial_insts = {**phase1_insts, **phase2_insts}
+        out_contracts = os.path.join(DATA_DIR, "raw", "ujn", "jnportal_contracts.json")
+        out_institutions = os.path.join(DATA_DIR, "raw", "institutions", "jnportal_institutions.json")
+        with open(out_contracts, "w", encoding="utf-8") as f:
+            json.dump(partial_contracts, f, ensure_ascii=False, indent=2)
+        with open(out_institutions, "w", encoding="utf-8") as f:
+            json.dump(list(partial_insts.values()), f, ensure_ascii=False, indent=2)
+        logger.info("jnportal_partial_saved", count=len(partial_contracts))
+
         # Phase 3: non-competitive contracts (proc_type 3 and 9) — critical for corruption detection
+        # Note: Phase 2 already captured recent contracts; Phase 3 looks further back for non-competitive ones.
+        # seen_ids is NOT passed here so Phase 3 scans fresh from ContractDate DESC,
+        # deduplication happens below.
         phase3_quota = max_rows // 4
         phase3_contracts, phase3_insts = self._scrape_phase_proc_type(
             proc_types=[3, 9],
             max_rows=phase3_quota,
-            seen_ids=seen_ids,
+            seen_ids=None,
         )
         logger.info("jnportal_phase3_done", count=len(phase3_contracts))
 
-        contracts = phase1_contracts + phase2_contracts + phase3_contracts
+        # Deduplicate Phase 3 results against Phase 1+2
+        phase3_new = [c for c in phase3_contracts if c["contract_id"] not in seen_ids]
+        logger.info("jnportal_phase3_new", new=len(phase3_new), total=len(phase3_contracts))
+
+        contracts = phase1_contracts + phase2_contracts + phase3_new
         institutions_map = {**phase1_insts, **phase2_insts, **phase3_insts}
 
-        # Save outputs
+        # Save final outputs (overwrite partial)
         out_contracts = os.path.join(DATA_DIR, "raw", "ujn", "jnportal_contracts.json")
         out_institutions = os.path.join(DATA_DIR, "raw", "institutions", "jnportal_institutions.json")
         with open(out_contracts, "w", encoding="utf-8") as f:
@@ -392,7 +410,7 @@ class JNPortalScraper:
             "total_institutions": len(institutions_map),
             "phase1_by_value": len(phase1_contracts),
             "phase2_by_date": len(phase2_contracts),
-            "phase3_noncompetitive": len(phase3_contracts),
+            "phase3_noncompetitive": len(phase3_new),
             "min_value_rsd": min_value,
             "max_rows": max_rows,
             "scraped_at": datetime.utcnow().isoformat(),
@@ -404,6 +422,6 @@ class JNPortalScraper:
                     total=len(contracts),
                     phase1=len(phase1_contracts),
                     phase2=len(phase2_contracts),
-                    phase3=len(phase3_contracts),
+                    phase3=len(phase3_new),
                     institutions=len(institutions_map))
         return summary
