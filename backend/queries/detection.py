@@ -661,9 +661,12 @@ def value_just_below_threshold(tolerance_pct: float = 0.15, min_occurrences: int
     WITH inst, co, ct,
          coalesce(ct.value_rsd, ct.contract_value, 0) AS val
     // Flag contracts in the "suspicious zone" just below each threshold
-    WHERE (val >= 850000  AND val < 1000000)   // just below 1M threshold
-       OR (val >= 4250000 AND val < 5000000)   // just below 5M threshold
-       OR (val >= 12750000 AND val < 15000000) // just below 15M threshold
+    // TS Srbija research (2024): 31.27% of goods/services contracts cluster in 900K-1M zone
+    // Avenija sistem case: 5 contracts between 2.948M and 2.999M (below 3M works threshold)
+    WHERE (val >= 850000  AND val < 1000000)   // just below 1M goods/services threshold
+       OR (val >= 2700000 AND val < 3000000)   // just below 3M works threshold (most common)
+       OR (val >= 4250000 AND val < 5000000)   // just below 5M simplified procedure threshold
+       OR (val >= 12750000 AND val < 15000000) // just below 15M open tender threshold
     WITH inst, co,
          count(ct) AS num_suspicious,
          sum(coalesce(ct.value_rsd, ct.contract_value, 0)) AS total_value,

@@ -1515,6 +1515,137 @@ _PATTERN_META: dict = {
             ("num_contracts", "Broj ugovora"),
         ],
     },
+    "value_just_below_threshold": {
+        "icon": "🎯", "title": "Nameštanje vrednosti ispod praga",
+        "why": (
+            "Firma prima više ugovora čija vrednost je sistematski postavljena tik ispod zakonskih pragova "
+            "za sprovođenje javnog tendera. Ovo nije slučajnost — istraživanje Transparentnosti Srbije (2024) "
+            "pokazuje da čak 31,27% nabavki dobara/usluga pada u zonu 900.000–1.000.000 RSD, što je "
+            "statistički nemoguće bez nameštanja.\n\n"
+            "Srpski pragovi:\n"
+            "• 1.000.000 RSD — ispod ovoga direktni sporazum bez tendera\n"
+            "• 3.000.000 RSD — za radove: ispod ovoga direktni sporazum\n"
+            "• 5.000.000 RSD — ispod ovoga pojednostavljeni postupak\n"
+            "• 15.000.000 RSD — ispod ovoga ne mora se raspisati puni otvoreni tender\n\n"
+            "Dokumentovani slučaj: Firma 'Avenija sistem' dobila je 5 ugovora za radove od 5 različitih "
+            "obrazovnih institucija, sve u rasponu 2.948.000–2.999.250 RSD (tik ispod 3M praga). "
+            "Državni sekretar uhapšen je zbog organizovanja ove sheme."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "gde: Ugovor.value_rsd IN [850K–1M, 2.7M–3M, 4.25M–5M, 12.75M–15M]\n\n"
+            "count(takvih ugovora, ista firma) >= 2"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+            ("Transparentnost Srbija — istraživanje pragova (2024)",
+             "https://www.transparentnost.org.rs/index.php/sr/"),
+        ],
+        "fields": [
+            ("company_name", "Firma"), ("institution", "Naručilac"),
+            ("num_contracts", "Br. sumnjivih ugovora"), ("total_value", "Ukupna vrednost"),
+        ],
+    },
+    "zero_competition_repeat": {
+        "icon": "🚫", "title": "Višestruki ugovori bez konkurencije",
+        "why": (
+            "Ista institucija dodeljuje isti firmi više ugovora putem pregovaračkog postupka bez "
+            "prethodnog objavljivanja (tip 3) ili direktnog sporazuma (tip 9). Svaki slučaj posebno "
+            "je sumnjiv — ponavljanje je znak sistemskog zaobilaženja konkurencije.\n\n"
+            "Srpski Zakon o javnim nabavkama dozvoljava pregovarački postupak samo u izuzetnim "
+            "okolnostima (hitnost, jedinstvenost, bezbednost). Ponavlja li se 'izuzetak' uvek "
+            "sa istom firmom, radi se o zloupotrebi izuzetka."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "gde: Ugovor.proc_type IN ['3', '9'] ILI Ugovor.num_bidders = 1\n\n"
+            "count(takvih ugovora) >= 2 za isti par Institucija–Firma"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("institution", "Institucija"), ("company_name", "Firma"),
+            ("num_contracts", "Br. bez-konkurencije ugovora"), ("total_value", "Ukupna vrednost"),
+        ],
+    },
+    "distributed_evasion": {
+        "icon": "🕸", "title": "Raspoređeno izbegavanje nadzora",
+        "why": (
+            "Firma osvaja male ugovore od velikog broja različitih institucija — svaki pojedinacan "
+            "ugovor je ispod praga koji privlači pažnju, ali zbir svih ugovora je značajan. "
+            "Umesto jednog velikog ugovora koji bi bio vidljiv u statistikama, firma koristi "
+            "mrežu malih ugovora koji se 'gube' u sistemu."
+        ),
+        "how": (
+            "(Firma)-[WON_CONTRACT]->(Ugovor1, Ugovor2...)\n"
+            "(Institucija1, Institucija2, ...)-[AWARDED_CONTRACT]->(Ugorovi)\n\n"
+            "count(DISTINCT institucija) >= 3\n"
+            "prosečna vrednost po instituciji < 40% ukupne vrednosti\n"
+            "ukupna vrednost >= 2.000.000 RSD"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("company_name", "Firma"), ("num_institutions", "Broj institucija"),
+            ("total_contracts", "Ukupno ugovora"), ("total_value", "Ukupna vrednost"),
+            ("avg_per_institution", "Prosek po instituciji"),
+        ],
+    },
+    "party_linked_contractor": {
+        "icon": "🎖", "title": "Stranački kontakti — ugovor",
+        "why": (
+            "Narodni poslanik ili stranačko lice rukovodi firmom koja dobija ugovor od institucije "
+            "gde je zaposlen drugi član iste stranke. Oba kraja lanca (naručilac i dobavljač) "
+            "kontrolisana su od strane iste stranke — klasičan 'stranački zarobljeni tender'."
+        ),
+        "how": (
+            "(MP/Član stranke A)-[OWNS|DIRECTS]->(Firma)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Funkcioner stranke A)-[EMPLOYED_BY]->(Institucija)\n\n"
+            "Obe osobe moraju biti u istoj stranci; ne mogu biti ista osoba."
+        ),
+        "sources": [
+            ("Otvoreni Parlament", "https://otvoreniparlamet.rs"),
+            ("APR — Registar privrednih subjekata", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("mp_name", "Poslanik/Član stranke"), ("party_name", "Stranka"),
+            ("company_name", "Firma"), ("contract_title", "Ugovor"),
+            ("contract_value", "Vrednost"), ("institution", "Naručilac"),
+            ("party_official_at_institution", "Stranački funkcioner u instituciji"),
+        ],
+    },
+    "suspicious_price_concentration": {
+        "icon": "📊", "title": "Sektorski monopol",
+        "why": (
+            "Jedna firma osvaja 60%+ svih ugovora u svom sektoru delatnosti kod jedne institucije. "
+            "U zdravom tržištu, različite firme iste delatnosti trebalo bi da ravnomerno učestvuju "
+            "na tenderima. Dominacija jedne firme u specifičnom sektoru ukazuje da je tender "
+            "pisan po meri te firme ili da postoji ekskluzivni aranžman."
+        ),
+        "how": (
+            "(Firma)-[:WON_CONTRACT]->(Ugovor)\n"
+            "(Institucija)-[:AWARDED_CONTRACT]->(Ugovor)\n\n"
+            "GROUP BY delatnost_firme (APR šifra delatnosti)\n"
+            "firma_vrednost / ukupno_sektor_institucija >= 60%\n"
+            "USLOV: >= 3 konkurenta u sektoru"
+        ),
+        "sources": [
+            ("APR — Šifrarnik delatnosti", "https://pretraga.apr.gov.rs"),
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("company_name", "Firma"), ("institution", "Institucija"),
+            ("activity_code", "Šifra delatnosti"), ("num_contracts", "Broj ugovora"),
+            ("sector_pct", "% sektora institucije"), ("company_value", "Vrednost firme"),
+        ],
+    },
 }
 
 _PATTERN_ALIASES: dict = {
