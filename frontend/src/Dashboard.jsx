@@ -388,7 +388,7 @@ function RiskBadge({ level }) {
 }
 
 // ── Pattern Detail Modal ────────────────────────────────────────
-function PatternDetailModal({ alert, onClose, onShowOnGraph }) {
+function PatternDetailModal({ alert, onClose, onShowOnGraph, onOpenEntity }) {
   const exp = PATTERN_EXPLANATIONS[alert.pattern_type] || {};
   const color = SEVERITY_COLORS[alert.severity] || "#6b7280";
   const [rawOpen, setRawOpen] = useState(false);
@@ -577,6 +577,33 @@ function PatternDetailModal({ alert, onClose, onShowOnGraph }) {
               </pre>
             )}
           </section>
+
+          {/* Entity quick-links */}
+          {onOpenEntity && (alert.company_mb || alert.company_name) && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {alert.company_mb && (
+                <button onClick={() => onOpenEntity(alert.company_mb, "Company", alert.company_name || alert.company_mb)} style={{
+                  flex: 1, padding: "9px 14px", borderRadius: 8, cursor: "pointer",
+                  background: "#3b82f622", border: "1px solid #3b82f644", color: "#93c5fd",
+                  fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}>🏢 Profil firme: {alert.company_name}</button>
+              )}
+              {alert.official_id && (
+                <button onClick={() => onOpenEntity(alert.official_id, "Person", alert.official_name || alert.official_id)} style={{
+                  flex: 1, padding: "9px 14px", borderRadius: 8, cursor: "pointer",
+                  background: "#f59e0b22", border: "1px solid #f59e0b44", color: "#fbbf24",
+                  fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}>👤 Profil: {alert.official_name}</button>
+              )}
+              {alert.institution_id && (
+                <button onClick={() => onOpenEntity(alert.institution_id, "Institution", alert.institution || alert.institution_id)} style={{
+                  flex: 1, padding: "9px 14px", borderRadius: 8, cursor: "pointer",
+                  background: "#10b98122", border: "1px solid #10b98144", color: "#6ee7b7",
+                  fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}>🏛 Profil: {(alert.institution || "").slice(0, 35)}{(alert.institution || "").length > 35 ? "…" : ""}</button>
+              )}
+            </div>
+          )}
 
           {/* CTA */}
           <button onClick={onShowOnGraph} style={{
@@ -841,6 +868,225 @@ function EntityBrowser({ type, label, color, onClose, onSelectEntity, excludeSee
   );
 }
 
+// ── Entity Detail Modal ─────────────────────────────────────────
+function EntityDetailModal({ entityId, entityType, entityName, onClose, onNavigate, onShowOnGraph }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setData(null);
+    setLoading(true);
+    let url;
+    if (entityType === "Company") url = `/company/${encodeURIComponent(entityId)}`;
+    else if (entityType === "Person") url = `/person/${encodeURIComponent(entityId)}`;
+    else if (entityType === "Institution") url = `/institution/${encodeURIComponent(entityId)}`;
+    else { setLoading(false); return; }
+    apiFetch(url).then(d => { setData(d); setLoading(false); });
+  }, [entityId, entityType]);
+
+  const color = ENTITY_COLORS[entityType] || "#6b7280";
+  const aprLink = entityType === "Company" && data?.company?.maticni_broj
+    ? `https://pretraga.apr.gov.rs/unifiedsearch?searchTerm=${data.company.maticni_broj}`
+    : null;
+
+  const renderCompany = () => {
+    const co = data.company || {};
+    const directors = [...new Map((data.directors || []).filter(d => d.name).map(d => [d.name, d])).values()];
+    const contracts = (data.contracts || []).filter(c => c.title).sort((a, b) => (b.value || 0) - (a.value || 0));
+    const totalValue = contracts.reduce((s, c) => s + (c.value || 0), 0);
+    return (
+      <>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+          {co.founding_date && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#94a3b8", fontFamily: "monospace" }}>📅 {co.founding_date}</span>}
+          {co.activity_name && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#94a3b8" }}>{co.activity_name}</span>}
+          {co.maticni_broj && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#64748b", fontFamily: "monospace" }}>MB: {co.maticni_broj}</span>}
+          {co.pib && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#64748b", fontFamily: "monospace" }}>PIB: {co.pib}</span>}
+        </div>
+
+        {directors.length > 0 && (
+          <section style={{ marginBottom: 20 }}>
+            <SectionTitle icon="👤" title={`Direktori / vlasnici (${directors.length})`} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {directors.map((d, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", background: "#111827", borderRadius: 6 }}>
+                  <span style={{ fontSize: 12, color: "#f59e0b", fontWeight: 600 }}>{d.name}</span>
+                  {d.id && <button onClick={() => onNavigate(d.id, "Person", d.name)} style={{ fontSize: 9, padding: "2px 7px", background: "#f59e0b22", border: "1px solid #f59e0b44", color: "#f59e0b", borderRadius: 4, cursor: "pointer", fontFamily: "monospace" }}>Profil →</button>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <section>
+          <SectionTitle icon="📄" title={`Ugovori (${contracts.length}) — ukupno ${formatRSD(totalValue)}`} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 380, overflowY: "auto" }}>
+            {contracts.map((c, i) => (
+              <div key={i} style={{ padding: "8px 12px", background: "#111827", borderRadius: 6, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 11, color: "#e2e8f0", lineHeight: 1.5 }}>{c.title}</div>
+                  {c.institution && <div style={{ fontSize: 10, color: "#10b981", marginTop: 2 }}>{c.institution}</div>}
+                  {c.date && <div style={{ fontSize: 9, color: "#475569", marginTop: 1, fontFamily: "monospace" }}>{c.date}</div>}
+                </div>
+                <div style={{ flexShrink: 0, textAlign: "right" }}>
+                  <div style={{ fontSize: 11, color: "#f59e0b", fontWeight: 700, fontFamily: "monospace" }}>{formatRSD(c.value)}</div>
+                  <a href={`https://jnportal.ujn.gov.rs/tender-documents/${c.id?.replace("JNP-", "")}`} target="_blank" rel="noopener noreferrer" style={{ fontSize: 8, color: "#3b82f6", textDecoration: "none" }}>↗ JN</a>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </>
+    );
+  };
+
+  const renderPerson = () => {
+    const p = data.person || {};
+    const companies = (data.outgoing || []).filter(r => r.name && r.type);
+    const institutions = (data.incoming || []).filter(r => r.name && r.type);
+    return (
+      <>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+          {p.source && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#94a3b8", fontFamily: "monospace" }}>{p.source.toUpperCase()}</span>}
+          {p.person_id && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#64748b", fontFamily: "monospace" }}>{p.person_id}</span>}
+        </div>
+        {companies.length > 0 && (
+          <section style={{ marginBottom: 20 }}>
+            <SectionTitle icon="🏢" title={`Veze ka firmama (${companies.length})`} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {companies.map((r, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", background: "#111827", borderRadius: 6 }}>
+                  <div>
+                    <span style={{ fontSize: 11, color: "#3b82f6", fontWeight: 600 }}>{r.name}</span>
+                    <span style={{ fontSize: 9, color: "#475569", marginLeft: 8, fontFamily: "monospace" }}>{r.type}</span>
+                  </div>
+                  {r.id && <button onClick={() => onNavigate(r.id, r.target_label || "Company", r.name)} style={{ fontSize: 9, padding: "2px 7px", background: "#3b82f622", border: "1px solid #3b82f644", color: "#3b82f6", borderRadius: 4, cursor: "pointer", fontFamily: "monospace" }}>Profil →</button>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+        {institutions.length > 0 && (
+          <section>
+            <SectionTitle icon="🏛" title={`Veze ka institucijama (${institutions.length})`} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {institutions.map((r, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", background: "#111827", borderRadius: 6 }}>
+                  <div>
+                    <span style={{ fontSize: 11, color: "#10b981" }}>{r.name}</span>
+                    <span style={{ fontSize: 9, color: "#475569", marginLeft: 8, fontFamily: "monospace" }}>{r.type}</span>
+                  </div>
+                  {r.id && <button onClick={() => onNavigate(r.id, r.source_label || "Institution", r.name)} style={{ fontSize: 9, padding: "2px 7px", background: "#10b98122", border: "1px solid #10b98144", color: "#10b981", borderRadius: 4, cursor: "pointer", fontFamily: "monospace" }}>Profil →</button>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+      </>
+    );
+  };
+
+  const renderInstitution = () => {
+    const inst = data.institution || {};
+    const contracts = (data.contracts || []).filter(c => c.title).sort((a, b) => (b.value || 0) - (a.value || 0));
+    const totalValue = contracts.reduce((s, c) => s + (c.value || 0), 0);
+    const employees = (data.employees || []).filter(e => e.name);
+    return (
+      <>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+          {inst.maticni_broj && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#64748b", fontFamily: "monospace" }}>MB: {inst.maticni_broj}</span>}
+          {inst.pib && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#1e293b", color: "#64748b", fontFamily: "monospace" }}>PIB: {inst.pib}</span>}
+          {inst.verification_url && <a href={inst.verification_url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#0d1f3c", color: "#60a5fa", border: "1px solid #1e3a5f", textDecoration: "none" }}>↗ UJN portal</a>}
+        </div>
+        {employees.length > 0 && (
+          <section style={{ marginBottom: 20 }}>
+            <SectionTitle icon="👤" title={`Zaposleni funkcioneri (${employees.length})`} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {employees.map((e, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", background: "#111827", borderRadius: 6 }}>
+                  <span style={{ fontSize: 11, color: "#f59e0b" }}>{e.name}</span>
+                  {e.role && <span style={{ fontSize: 9, color: "#475569" }}>{e.role}</span>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+        <section>
+          <SectionTitle icon="📄" title={`Javne nabavke (${contracts.length}) — ukupno ${formatRSD(totalValue)}`} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 380, overflowY: "auto" }}>
+            {contracts.map((c, i) => (
+              <div key={i} style={{ padding: "8px 12px", background: "#111827", borderRadius: 6, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 11, color: "#e2e8f0", lineHeight: 1.5 }}>{c.title}</div>
+                  {c.winner && <div style={{ fontSize: 10, color: "#3b82f6", marginTop: 2 }}>{c.winner}</div>}
+                  {c.date && <div style={{ fontSize: 9, color: "#475569", marginTop: 1, fontFamily: "monospace" }}>{c.date}</div>}
+                </div>
+                <div style={{ flexShrink: 0 }}>
+                  <div style={{ fontSize: 11, color: "#f59e0b", fontWeight: 700, fontFamily: "monospace" }}>{formatRSD(c.value)}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </>
+    );
+  };
+
+  const TYPE_ICONS = { Company: "🏢", Person: "👤", Institution: "🏛" };
+
+  return (
+    <div onClick={e => e.target === e.currentTarget && onClose()} style={{
+      position: "fixed", inset: 0, zIndex: 1100,
+      display: "flex", justifyContent: "flex-end",
+      background: "rgba(0,0,0,0.65)", backdropFilter: "blur(3px)",
+    }}>
+      <div style={{
+        width: "min(620px, 97vw)", background: "#0d1525",
+        borderLeft: "1px solid #1e293b", overflowY: "auto",
+        display: "flex", flexDirection: "column",
+        animation: "slideInRight 0.2s ease-out",
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: "18px 22px 14px", borderBottom: "1px solid #1e293b",
+          position: "sticky", top: 0, zIndex: 2,
+          background: "#0d1525ee", backdropFilter: "blur(8px)",
+          borderTop: `3px solid ${color}`,
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+              <span style={{ fontSize: 22 }}>{TYPE_ICONS[entityType] || "◎"}</span>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 9, color: color, fontWeight: 700, textTransform: "uppercase", fontFamily: "monospace", letterSpacing: "0.1em" }}>{entityType}</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "#f8fafc", letterSpacing: "-0.02em", wordBreak: "break-word" }}>{entityName}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+              {onShowOnGraph && (
+                <button onClick={onShowOnGraph} style={{ padding: "5px 10px", borderRadius: 6, cursor: "pointer", background: "#1e293b", border: "1px solid #334155", color: "#94a3b8", fontSize: 10, fontFamily: "monospace" }}>◎ Graf</button>
+              )}
+              {aprLink && (
+                <a href={aprLink} target="_blank" rel="noopener noreferrer" style={{ padding: "5px 10px", borderRadius: 6, background: "#0d1f3c", border: "1px solid #1e3a5f", color: "#60a5fa", fontSize: 10, fontFamily: "monospace", textDecoration: "none" }}>↗ APR</a>
+              )}
+              <button onClick={onClose} style={{ background: "#1e293b", border: "1px solid #334155", color: "#94a3b8", width: 30, height: 30, borderRadius: 6, cursor: "pointer", fontSize: 18, display: "flex", alignItems: "center", justifyContent: "center" }}>×</button>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ padding: "20px 22px", display: "flex", flexDirection: "column", gap: 0 }}>
+          {loading ? (
+            <div style={{ padding: 40, display: "flex", justifyContent: "center" }}><Spinner size={28} /></div>
+          ) : !data ? (
+            <div style={{ color: "#475569", fontSize: 13, textAlign: "center", padding: 40 }}>Nema podataka</div>
+          ) : entityType === "Company" ? renderCompany()
+            : entityType === "Person" ? renderPerson()
+            : entityType === "Institution" ? renderInstitution()
+            : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Main Dashboard ──────────────────────────────────────────────
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState("graph");
@@ -855,6 +1101,7 @@ export default function Dashboard() {
   const [isDemo, setIsDemo] = useState(true);
   const [loading, setLoading] = useState(true);
   const [entityBrowser, setEntityBrowser] = useState(null); // { type, label, color }
+  const [detailEntity, setDetailEntity] = useState(null); // { id, type, name }
 
   const [nodes, setNodes] = useState(DEMO_NODES);
   const [edges, setEdges] = useState(DEMO_EDGES);
@@ -1120,6 +1367,18 @@ export default function Dashboard() {
           alert={detailAlert}
           onClose={() => setDetailAlert(null)}
           onShowOnGraph={() => handleShowOnGraph(detailAlert)}
+          onOpenEntity={(id, type, name) => { setDetailAlert(null); setDetailEntity({ id, type, name }); }}
+        />
+      )}
+
+      {detailEntity && (
+        <EntityDetailModal
+          entityId={detailEntity.id}
+          entityType={detailEntity.type}
+          entityName={detailEntity.name}
+          onClose={() => setDetailEntity(null)}
+          onNavigate={(id, type, name) => setDetailEntity({ id, type, name })}
+          onShowOnGraph={() => { setDetailEntity(null); exploreEntity(detailEntity.id, detailEntity.type); setActiveTab("graph"); }}
         />
       )}
 
@@ -1340,12 +1599,20 @@ export default function Dashboard() {
                 {selectedNode.props?.value_rsd && <div style={{ fontSize: 10, color: "#f59e0b", marginTop: 3, fontFamily: "'IBM Plex Mono', monospace" }}>{formatRSD(selectedNode.props.value_rsd)}</div>}
                 {selectedNode.props?.status && <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 3 }}>Status: {selectedNode.props.status}</div>}
                 {!isDemo && (
-                  <button onClick={() => exploreEntity(selectedNode.id, selectedNode.type)} style={{
-                    marginTop: 8, background: (ENTITY_COLORS[selectedNode.type] || "#3b82f6") + "22",
-                    border: `1px solid ${(ENTITY_COLORS[selectedNode.type] || "#3b82f6")}44`,
-                    color: "#e2e8f0", padding: "4px 10px", borderRadius: 4,
-                    fontSize: 10, cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace",
-                  }}>Istraži mrežu →</button>
+                  <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                    <button onClick={() => setDetailEntity({ id: selectedNode.id, type: selectedNode.type, name: selectedNode.name })} style={{
+                      flex: 1, background: (ENTITY_COLORS[selectedNode.type] || "#3b82f6") + "22",
+                      border: `1px solid ${(ENTITY_COLORS[selectedNode.type] || "#3b82f6")}44`,
+                      color: "#e2e8f0", padding: "4px 10px", borderRadius: 4,
+                      fontSize: 10, cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace",
+                    }}>◈ Profil</button>
+                    <button onClick={() => exploreEntity(selectedNode.id, selectedNode.type)} style={{
+                      flex: 1, background: "#1e293b",
+                      border: "1px solid #334155",
+                      color: "#94a3b8", padding: "4px 10px", borderRadius: 4,
+                      fontSize: 10, cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace",
+                    }}>◎ Graf</button>
+                  </div>
                 )}
               </div>
             )}
@@ -1472,8 +1739,15 @@ export default function Dashboard() {
                           </div>
                         )}
 
-                        <div style={{ fontSize: 9, color: "#3b82f688", marginTop: 8, fontFamily: "'IBM Plex Mono', monospace", display: "flex", alignItems: "center", gap: 4 }}>
-                          ◉ Klikni za detalje, objašnjenje i izvore
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                          <div style={{ fontSize: 9, color: "#3b82f688", fontFamily: "'IBM Plex Mono', monospace" }}>◉ Klikni za detalje, objašnjenje i izvore</div>
+                          {alert.company_mb && (
+                            <button onClick={e => { e.stopPropagation(); setDetailEntity({ id: alert.company_mb, type: "Company", name: alert.company_name || alert.company_mb }); }} style={{
+                              fontSize: 9, padding: "2px 8px", borderRadius: 4, cursor: "pointer",
+                              background: "#3b82f622", border: "1px solid #3b82f644", color: "#93c5fd",
+                              fontFamily: "'IBM Plex Mono', monospace",
+                            }}>🏢 Profil firme</button>
+                          )}
                         </div>
                       </div>
                     );

@@ -483,10 +483,12 @@ def get_company(maticni_broj: str):
         OPTIONAL MATCH (owner:Person)-[:OWNS]->(c)
         OPTIONAL MATCH (director:Person)-[:DIRECTS]->(c)
         OPTIONAL MATCH (c)-[:WON_CONTRACT]->(ct:Contract)
+        OPTIONAL MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct)
         RETURN properties(c) AS company,
                collect(DISTINCT {name: owner.full_name, id: owner.person_id}) AS owners,
                collect(DISTINCT {name: director.full_name, id: director.person_id}) AS directors,
-               collect(DISTINCT {title: ct.title, value: ct.value_rsd, id: ct.contract_id}) AS contracts
+               collect(DISTINCT {title: ct.title, value: ct.value_rsd, id: ct.contract_id,
+                                  date: ct.award_date, institution: inst.name}) AS contracts
     """, {"mb": maticni_broj})
     if not company:
         raise HTTPException(404, "Company not found")
@@ -500,9 +502,11 @@ def get_institution(institution_id: str):
         MATCH (i:Institution {institution_id: $iid})
         OPTIONAL MATCH (emp:Person)-[:EMPLOYED_BY]->(i)
         OPTIONAL MATCH (i)-[:AWARDED_CONTRACT]->(ct:Contract)
+        OPTIONAL MATCH (winner:Company)-[:WON_CONTRACT]->(ct)
         RETURN properties(i) AS institution,
                collect(DISTINCT {name: emp.full_name, id: emp.person_id, role: emp.current_role}) AS employees,
-               collect(DISTINCT {title: ct.title, value: ct.value_rsd, id: ct.contract_id}) AS contracts
+               collect(DISTINCT {title: ct.title, value: ct.value_rsd, id: ct.contract_id,
+                                  date: ct.award_date, winner: winner.name}) AS contracts
     """, {"iid": institution_id})
     if not inst:
         raise HTTPException(404, "Institution not found")
