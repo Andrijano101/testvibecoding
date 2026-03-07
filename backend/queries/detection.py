@@ -731,7 +731,7 @@ def procurement_law_violation(legal_limit_rsd: int = 1_000_000):
         inst.institution_id AS institution_id,
         co.name AS company_name,
         co.maticni_broj AS company_mb,
-        ct.detail_url AS detail_url,
+        coalesce(ct.verification_url, ct.detail_url) AS verification_url,
         directors,
         severity,
         'procurement_law_violation' AS pattern_type

@@ -435,6 +435,7 @@ const PATTERN_EXPLANATIONS = {
       { key: "award_date", label: "Datum" },
       { key: "contract_title", label: "Predmet nabavke" },
       { key: "directors", label: "Direktor(i) firme" },
+      { key: "verification_url", label: "Link na ugovor" },
     ],
   },
   institution_threshold_cluster: {
