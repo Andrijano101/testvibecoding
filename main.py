@@ -1548,6 +1548,54 @@ _PATTERN_META: dict = {
             ("num_contracts", "Br. sumnjivih ugovora"), ("total_value", "Ukupna vrednost"),
         ],
     },
+    "procurement_law_violation": {
+        "icon": "⚖", "title": "Kršenje zakona o nabavkama — tip 11 iznad praga",
+        "why": (
+            "Ugovor je evidentiran kao 'jednostavna nabavka' (tip postupka 11), koja je zakonski "
+            "dozvoljena SAMO za vrednosti do 1.000.000 RSD (Zakon o javnim nabavkama, čl. 27). "
+            "Svaki ugovor iznad ovog praga, kodiran kao tip 11, predstavlja direktno kršenje zakona "
+            "ili namerno falsifikovanje evidencije u sistemu javnih nabavki.\n\n"
+            "Najteži slučajevi (> 100M RSD) mogu ukazivati na organizovanu prevaru — namerno "
+            "klasifikovanje milijarderskih ugovora kao 'malih nabavki' da bi se izbegao javni tender."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "(Firma)-[WON_CONTRACT]->(Ugovor)\n"
+            "gde: Ugovor.proc_type = '11' AND Ugovor.value_rsd > 1.000.000 RSD\n\n"
+            "Sortiran po vrednosti — veće vrednosti = teže kršenje"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+        ],
+        "fields": [
+            ("institution", "Institucija"), ("company_name", "Firma"),
+            ("value_rsd", "Vrednost ugovora"), ("award_date", "Datum"),
+            ("contract_title", "Predmet"), ("directors", "Direktor(i) firme"),
+        ],
+    },
+    "institution_threshold_cluster": {
+        "icon": "🎯", "title": "Institucija sistematski koristi pragove",
+        "why": (
+            "Institucija dodeljuje veliki broj ugovora čija vrednost pada tik ispod zakonskih pragova, "
+            "ali različitim firmama. Za razliku od klasičnog deljenja ugovora (ista firma), ovde "
+            "institucija sistematski 'raspoređuje' posao ispod praga — moguće između povezanih firmi. "
+            "Istraživanje TS Srbija (2024): 31.27% nabavki pada u zonu 900K–1M RSD."
+        ),
+        "how": (
+            "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n"
+            "gde: Ugovor.value_rsd IN [850K–1M, 2.7M–3M, 4.25M–5M, 12.75M–15M]\n\n"
+            "count(takvih ugovora od iste institucije) >= 3"
+        ),
+        "sources": [
+            ("Portal javnih nabavki", "https://jnportal.ujn.gov.rs/tender-documents/search"),
+            ("Transparentnost Srbija — istraživanje pragova (2024)",
+             "https://www.transparentnost.org.rs/index.php/sr/"),
+        ],
+        "fields": [
+            ("institution", "Institucija"), ("num_contracts", "Br. ugovora ispod praga"),
+            ("num_companies", "Br. različitih firmi"), ("total_value", "Ukupna vrednost"),
+        ],
+    },
     "zero_competition_repeat": {
         "icon": "🚫", "title": "Višestruki ugovori bez konkurencije",
         "why": (

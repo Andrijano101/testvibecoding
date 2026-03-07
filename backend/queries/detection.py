@@ -696,6 +696,94 @@ def value_just_below_threshold(tolerance_pct: float = 0.15, min_occurrences: int
     """, {"min_occurrences": min_occurrences}
 
 
+def procurement_law_violation(legal_limit_rsd: int = 1_000_000):
+    """Contracts using 'jednostavna nabavka' (proc_type 11) with values far above the legal 1M RSD limit.
+
+    Proc type 11 is only legal for contracts below 1M RSD (Serbian procurement law Art. 27).
+    Any contract exceeding this coded as type 11 is either:
+      - A deliberate attempt to avoid competitive bidding requirements
+      - A systemic data falsification in procurement records
+    Both warrant investigation. Contracts > 10M RSD under type 11 are particularly egregious.
+    """
+    return """
+    MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct:Contract)
+    MATCH (co:Company)-[:WON_CONTRACT]->(ct)
+    WITH inst, co, ct,
+         coalesce(ct.value_rsd, ct.contract_value, 0) AS val,
+         ct.proc_type AS ptype
+    WHERE ptype = '11' AND val > $legal_limit
+    WITH inst, co, ct, val,
+         CASE
+           WHEN val >= 100000000 THEN 'critical'
+           WHEN val >= 10000000  THEN 'high'
+           WHEN val >= 2000000   THEN 'medium'
+           ELSE 'low'
+         END AS severity
+    OPTIONAL MATCH (dir:Person)-[:DIRECTS|OWNS]->(co)
+    WITH inst, co, ct, val, severity,
+         collect(DISTINCT dir.full_name) AS directors
+    RETURN
+        ct.title AS contract_title,
+        ct.contract_id AS contract_id,
+        val AS value_rsd,
+        ct.award_date AS award_date,
+        inst.name AS institution,
+        inst.institution_id AS institution_id,
+        co.name AS company_name,
+        co.maticni_broj AS company_mb,
+        ct.detail_url AS detail_url,
+        directors,
+        severity,
+        'procurement_law_violation' AS pattern_type
+    ORDER BY val DESC
+    LIMIT 100
+    """, {"legal_limit": legal_limit_rsd}
+
+
+def institution_threshold_cluster(min_contracts: int = 3):
+    """Institution awards many contracts in the suspicious just-below-threshold zones.
+
+    Unlike value_just_below_threshold (which requires the same company winning),
+    this detects when an institution *systematically* issues contracts near thresholds,
+    possibly distributing work across multiple shell/related companies.
+    TS Srbija research: 31.27% of contracts cluster in 900K-1M zone.
+    """
+    return """
+    MATCH (inst:Institution)-[:AWARDED_CONTRACT]->(ct:Contract)
+    MATCH (co:Company)-[:WON_CONTRACT]->(ct)
+    WITH inst, ct, co,
+         coalesce(ct.value_rsd, ct.contract_value, 0) AS val
+    WHERE (val >= 850000  AND val < 1000000)
+       OR (val >= 2700000 AND val < 3000000)
+       OR (val >= 4250000 AND val < 5000000)
+       OR (val >= 12750000 AND val < 15000000)
+    WITH inst,
+         count(ct) AS num_contracts,
+         count(DISTINCT co) AS num_companies,
+         sum(coalesce(ct.value_rsd, ct.contract_value, 0)) AS total_value,
+         collect({title: ct.title, value: coalesce(ct.value_rsd, ct.contract_value, 0),
+                  company: co.name, date: ct.award_date, id: ct.contract_id}) AS contracts_detail
+    WHERE num_contracts >= $min_contracts
+    WITH inst, num_contracts, num_companies, total_value, contracts_detail,
+         CASE
+           WHEN num_contracts >= 10 OR total_value >= 10000000 THEN 'critical'
+           WHEN num_contracts >= 5  OR total_value >= 3000000  THEN 'high'
+           ELSE 'medium'
+         END AS severity
+    RETURN
+        inst.name AS institution,
+        inst.institution_id AS institution_id,
+        num_contracts,
+        num_companies,
+        total_value,
+        contracts_detail,
+        severity,
+        'institution_threshold_cluster' AS pattern_type
+    ORDER BY num_contracts DESC, total_value DESC
+    LIMIT 100
+    """, {"min_contracts": min_contracts}
+
+
 def distributed_evasion(min_institutions: int = 3, min_total_rsd: int = 2_000_000):
     """Company wins small contracts from many different institutions to stay below detection radar.
 
@@ -878,6 +966,8 @@ ALL_DETECTORS = [
     ("zero_competition_repeat",    lambda: zero_competition_repeat()),
     ("contract_splitting",         lambda: contract_splitting()),
     ("value_just_below_threshold", lambda: value_just_below_threshold()),
+    ("procurement_law_violation",  lambda: procurement_law_violation()),
+    ("institution_threshold_cluster", lambda: institution_threshold_cluster()),
     # Market concentration
     ("repeated_winner",            lambda: repeated_winner()),
     ("institutional_monopoly",     lambda: institutional_monopoly()),

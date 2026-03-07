@@ -86,6 +86,8 @@ const PATTERN_LABELS = {
   distributed_evasion: "Raspoređeno izbegavanje nadzora",
   party_linked_contractor: "Stranački kontakti — ugovor",
   suspicious_price_concentration: "Sektorski monopol",
+  procurement_law_violation: "Kršenje zakona — tip 11 iznad praga",
+  institution_threshold_cluster: "Institucija sistematski koristi pragove",
 };
 
 // Real Serbian government portal URLs for verification
@@ -417,6 +419,36 @@ const PATTERN_EXPLANATIONS = {
       { key: "num_contracts", label: "Broj ugovora" },
       { key: "sector_pct", label: "% sektora institucije" },
       { key: "company_value", label: "Vrednost firme" },
+    ],
+  },
+  procurement_law_violation: {
+    icon: "⚖",
+    title: "Kršenje zakona — jednostavna nabavka iznad praga",
+    why: "Ugovor je evidentiran kao 'jednostavna nabavka' (tip 11), ali vrednost daleko premašuje zakonski limit od 1.000.000 RSD (ZJN, čl. 27). Ovo je direktno kršenje Zakona o javnim nabavkama ili namerno falsifikovanje evidencije da bi se izbegao obavezni javni tender. Ugovori vredni milijarde RSD klasifikovani kao 'male nabavke' ukazuju na sistemsku prevaru.",
+    how: "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\n(Firma)-[WON_CONTRACT]->(Ugovor)\ngde: Ugovor.proc_type = '11' AND vrednost > 1.000.000 RSD\n\nSortiran po vrednosti — veće vrednosti = teže kršenje",
+    sourcePortals: ["procurement"],
+    sources: ["Portal javnih nabavki — tip postupka i vrednost ugovora"],
+    fields: [
+      { key: "institution", label: "Institucija" },
+      { key: "company_name", label: "Firma" },
+      { key: "value_rsd", label: "Vrednost ugovora" },
+      { key: "award_date", label: "Datum" },
+      { key: "contract_title", label: "Predmet nabavke" },
+      { key: "directors", label: "Direktor(i) firme" },
+    ],
+  },
+  institution_threshold_cluster: {
+    icon: "🎯",
+    title: "Institucija sistematski koristi pragove",
+    why: "Institucija dodeljuje veliki broj ugovora čija vrednost sistematski pada tik ispod zakonskih pragova (1M, 3M, 5M, 15M RSD), ali različitim firmama. Ovo ukazuje da se 'nameštanje praga' odvija na nivou institucije, a ne pojedinačnih firmi — moguće uz raspoređivanje posla između povezanih preduzeća. Istraživanje TS Srbija (2024): 31.27% nabavki pada u zonu 900K–1M RSD.",
+    how: "(Institucija)-[AWARDED_CONTRACT]->(Ugovor)\ngde vrednost IN [850K–1M, 2.7M–3M, 4.25M–5M, 12.75M–15M]\n\ncount(ugovora od iste institucije) >= 3",
+    sourcePortals: ["procurement"],
+    sources: ["Portal javnih nabavki — vrednosti ugovora i pragovi", "Transparentnost Srbija — istraživanje pragova (2024)"],
+    fields: [
+      { key: "institution", label: "Institucija" },
+      { key: "num_contracts", label: "Br. ugovora ispod praga" },
+      { key: "num_companies", label: "Br. različitih firmi" },
+      { key: "total_value", label: "Ukupna vrednost" },
     ],
   },
 };
@@ -1179,6 +1211,8 @@ function EntityDetailModal({ entityId, entityType, entityName, onClose, onNaviga
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState("graph");
   const [showTestData, setShowTestData] = useState(true);
+  const [alertSearch, setAlertSearch] = useState("");
+  const [severityFilter, setSeverityFilter] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -1312,10 +1346,16 @@ export default function Dashboard() {
   const filteredAlerts = useMemo(() =>
     alerts.filter(a => {
       if (!showTestData && isSeedAlert(a)) return false;
+      if (severityFilter && a.severity !== severityFilter) return false;
+      const q = alertSearch.toLowerCase();
+      if (q) {
+        const haystack = Object.values(a).join(" ").toLowerCase();
+        if (!haystack.includes(q) && !(PATTERN_LABELS[a.pattern_type] || "").toLowerCase().includes(q)) return false;
+      }
       return !searchQuery ||
         Object.values(a).join(" ").toLowerCase().includes(searchQuery.toLowerCase()) ||
         (PATTERN_LABELS[a.pattern_type] || "").toLowerCase().includes(searchQuery.toLowerCase());
-    }), [alerts, searchQuery, showTestData]);
+    }), [alerts, searchQuery, showTestData, alertSearch, severityFilter]);
 
   const visibleNodes = useMemo(() =>
     showTestData ? nodes : nodes.filter(n => n.props?.source !== 'seed'),
@@ -1762,6 +1802,41 @@ export default function Dashboard() {
                     </div>
                   )}
                 </div>
+
+                {/* Alert filters: severity toggles + search */}
+                <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  {["", "critical", "high", "medium", "low"].map(s => (
+                    <button key={s} onClick={() => setSeverityFilter(sv => sv === s ? "" : s)} style={{
+                      fontSize: 9, padding: "3px 9px", borderRadius: 4, cursor: "pointer",
+                      fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, border: "1px solid",
+                      background: severityFilter === s ? (SEVERITY_COLORS[s] || "#334155") + "33" : "transparent",
+                      borderColor: severityFilter === s ? (SEVERITY_COLORS[s] || "#475569") : "#334155",
+                      color: severityFilter === s ? (SEVERITY_COLORS[s] || "#e2e8f0") : "#64748b",
+                      transition: "all 0.15s",
+                    }}>
+                      {s ? s.toUpperCase() : "SVE"}
+                    </button>
+                  ))}
+                  <input
+                    type="text"
+                    placeholder="Pretraži alarme..."
+                    value={alertSearch}
+                    onChange={e => setAlertSearch(e.target.value)}
+                    style={{
+                      flex: 1, minWidth: 120, fontSize: 11, padding: "3px 10px", borderRadius: 4,
+                      background: "#111827", border: "1px solid #334155", color: "#e2e8f0",
+                      fontFamily: "inherit", outline: "none",
+                    }}
+                  />
+                  {(alertSearch || severityFilter) && (
+                    <button onClick={() => { setAlertSearch(""); setSeverityFilter(""); }} style={{
+                      fontSize: 9, padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                      background: "transparent", border: "1px solid #334155", color: "#64748b",
+                      fontFamily: "'IBM Plex Mono', monospace",
+                    }}>✕</button>
+                  )}
+                </div>
+
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   {filteredAlerts.map((alert, i) => {
                     const exp = PATTERN_EXPLANATIONS[alert.pattern_type] || {};
@@ -1818,6 +1893,12 @@ export default function Dashboard() {
                           )}
                           {alert.pattern_type === 'direct_official_contractor' && alert.official_name && (
                             <span><strong style={{ color: "#f87171" }}>{alert.official_name}</strong> ({alert.institution}) → <strong style={{ color: "#3b82f6" }}>{alert.company_name}</strong></span>
+                          )}
+                          {alert.pattern_type === 'procurement_law_violation' && (
+                            <span><strong style={{ color: "#10b981" }}>{alert.institution}</strong> → <strong style={{ color: "#3b82f6" }}>{alert.company_name}</strong><span style={{ color: "#ef4444", fontSize: 10, marginLeft: 6 }}>tip 11 &gt; 1M RSD</span></span>
+                          )}
+                          {alert.pattern_type === 'institution_threshold_cluster' && alert.institution && (
+                            <span><strong style={{ color: "#10b981" }}>{alert.institution}</strong> — {alert.num_contracts} ugovora ispod praga ({alert.num_companies} firmi)</span>
                           )}
                         </div>
 
